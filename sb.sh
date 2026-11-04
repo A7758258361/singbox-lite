@@ -1,6 +1,6 @@
 #!/bin/sh
 # ==============================================================================
-# sing-box-lite 极简四协议自定义安装与管理脚本 (Alpine / Debian 终极修复版)
+# sing-box-lite 极简四协议自定义安装与管理脚本 (Alpine / Debian 终极版)
 # 特性: 自定义端口 + IPv4/IPv6 入口选择 + 1C64M 防 OOM + 协议动态增删
 # ==============================================================================
 
@@ -28,7 +28,7 @@ if [ -f /etc/alpine-release ]; then
     OS_TYPE="alpine"
     echo -e "${YELLOW}[1/6] 检测到 Alpine Linux，正在检查基础依赖...${NC}"
     apk update >/dev/null 2>&1 || true
-    apk add --no-cache curl wget tar openssl ca-certificates jq iproute2 iptables ip6tables psmisc >/dev/null 2>&1 || true
+    apk add --no-cache curl wget tar openssl ca-certificates jq iproute2 iptables psmisc >/dev/null 2>&1 || true
 else
     OS_TYPE="debian"
     echo -e "${YELLOW}[1/6] 检测到 Debian/Ubuntu 系统，正在检查基础依赖...${NC}"
@@ -114,25 +114,16 @@ fi
 
 # 4. 交互式选择监听 IP 栈与自定义端口
 echo -e "\n${CYAN}========================================================${NC}"
-echo -e "${YELLOW}请选择服务器监听的 IP 入口 (监听地址与节点生成偏好):${NC}"
-echo "  1) 仅 IPv4  (0.0.0.0)      - 节点地址使用 IPv4"
-echo "  2) 仅 IPv6  ([::])         - 节点地址强制使用 IPv6"
-echo "  3) 双栈监听 (::)           - 同时支持 IPv4/IPv6 (节点默认优先 IPv4)"
+echo -e "${YELLOW}请选择服务器监听的 IP 入口 (监听地址):${NC}"
+echo "  1) 仅 IPv4  (0.0.0.0)      - 推荐纯 IPv4 机器或防止双栈冲突"
+echo "  2) 仅 IPv6  ([::])         - 适用于纯 IPv6 小鸡"
+echo "  3) 双栈监听 (::)           - 同时支持 IPv4 和 IPv6"
 printf "请输入选项 [1-3, 默认 1]: "
 read -r ip_choice
 case "$ip_choice" in
-    2)
-        LISTEN_ADDR="::"
-        IP_PREF="v6"
-        ;;
-    3)
-        LISTEN_ADDR="::"
-        IP_PREF="dual"
-        ;;
-    *)
-        LISTEN_ADDR="0.0.0.0"
-        IP_PREF="v4"
-        ;;
+    2) LISTEN_ADDR="::" ;;
+    3) LISTEN_ADDR="::" ;;
+    *) LISTEN_ADDR="0.0.0.0" ;;
 esac
 
 get_free_port() {
@@ -197,7 +188,7 @@ jq -n \
     --arg pub "$PUBLIC_KEY" \
     --arg sid "$SHORT_ID" \
     --arg listen "$LISTEN_ADDR" \
-    --arg ip_pref "$IP_PREF" \
+    --arg ip_choice "$ip_choice" \
     --argjson pr "$PORT_REALITY" \
     --argjson ph "$PORT_HY2" \
     --argjson pt "$PORT_TUIC" \
@@ -211,7 +202,7 @@ jq -n \
         public_key: $pub,
         short_id: $sid,
         listen: $listen,
-        ip_pref: $ip_pref,
+        ip_choice: $ip_choice,
         ports: {
             "vless-in": $pr,
             "hy2-in": $ph,
@@ -399,16 +390,6 @@ YELLOW='\033[0;33m'
 CYAN='\033[0;36m'
 NC='\033[0m'
 
-get_free_port() {
-    while true; do
-        R=$((20000 + ($(od -An -N2 -tu2 /dev/urandom | tr -d ' ') % 35000)))
-        if ! ss -tuln 2>/dev/null | grep -q ":$R "; then
-            echo "$R"
-            return
-        fi
-    done
-}
-
 is_running() {
     pidof sing-box >/dev/null 2>&1 || ps aux 2>/dev/null | grep "[s]ing-box run" >/dev/null 2>&1
 }
@@ -457,42 +438,21 @@ open_port() {
     [ -z "$PORT" ] && return
     iptables -C INPUT -p tcp --dport "$PORT" -j ACCEPT 2>/dev/null || iptables -I INPUT -p tcp --dport "$PORT" -j ACCEPT 2>/dev/null || true
     iptables -C INPUT -p udp --dport "$PORT" -j ACCEPT 2>/dev/null || iptables -I INPUT -p udp --dport "$PORT" -j ACCEPT 2>/dev/null || true
-    ip6tables -C INPUT -p tcp --dport "$PORT" -j ACCEPT 2>/dev/null || ip6tables -I INPUT -p tcp --dport "$PORT" -j ACCEPT 2>/dev/null || true
-    ip6tables -C INPUT -p udp --dport "$PORT" -j ACCEPT 2>/dev/null || ip6tables -I INPUT -p udp --dport "$PORT" -j ACCEPT 2>/dev/null || true
-}
-
-get_ipv4() {
-    IP4=$(curl -s4m4 https://api.ipify.org 2>/dev/null || curl -s4m4 https://ip.sb 2>/dev/null || curl -s4m4 https://icanhazip.com 2>/dev/null)
-    IP4=$(echo "$IP4" | tr -d '\r\n ')
-    if echo "$IP4" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
-        echo "$IP4"
-    fi
-}
-
-get_ipv6() {
-    IP6=$(curl -s6m4 https://api64.ipify.org 2>/dev/null || curl -s6m4 https://ip.sb 2>/dev/null || curl -s6m4 https://icanhazip.com 2>/dev/null)
-    IP6=$(echo "$IP6" | tr -d '\r\n ')
-    if [ -z "$IP6" ]; then
-        IP6=$(ip -6 addr show scope global 2>/dev/null | awk '/inet6/ {print $2}' | cut -d/ -f1 | head -n 1 | tr -d '\r\n ')
-    fi
-    if [ -n "$IP6" ]; then
-        echo "[${IP6}]"
-    fi
 }
 
 get_server_ip() {
-    IP_PREF=$(jq -r '.ip_pref // "v4"' "$META_FILE" 2>/dev/null)
-
-    if [ "$IP_PREF" = "v6" ]; then
-        RES=$(get_ipv6)
-        [ -z "$RES" ] && RES=$(get_ipv4)
-    else
-        RES=$(get_ipv4)
-        [ -z "$RES" ] && RES=$(get_ipv6)
+    if [ "$(jq -r '.ip_choice // empty' "$META_FILE" 2>/dev/null)" != "2" ]; then
+        IP4=$(curl -s4m4 https://api.ipify.org 2>/dev/null || curl -s4m4 https://ip.sb 2>/dev/null)
+        IP4=$(echo "$IP4" | tr -d '\r\n ')
+        if echo "$IP4" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "$IP4"
+            return
+        fi
     fi
-
-    if [ -n "$RES" ]; then
-        echo "$RES"
+    IP6=$(curl -s6m4 https://api64.ipify.org 2>/dev/null || curl -s6m4 https://ip.sb 2>/dev/null)
+    IP6=$(echo "$IP6" | tr -d '\r\n ')
+    if [ -n "$IP6" ]; then
+        echo "[${IP6}]"
     else
         echo "YOUR_SERVER_IP"
     fi
@@ -527,7 +487,7 @@ refresh_nodes() {
         CLASH_LIST="${CLASH_LIST}
   - name: ${HOST_TAG}-Reality
     type: vless
-    server: \"${RAW_IP}\"
+    server: ${RAW_IP}
     port: ${P_VLESS}
     uuid: ${UUID}
     network: tcp
@@ -549,7 +509,7 @@ refresh_nodes() {
         CLASH_LIST="${CLASH_LIST}
   - name: ${HOST_TAG}-Hy2
     type: hysteria2
-    server: \"${RAW_IP}\"
+    server: ${RAW_IP}
     port: ${P_HY2}
     password: ${PASS}
     sni: ${TLS_SNI}
@@ -564,7 +524,7 @@ refresh_nodes() {
         CLASH_LIST="${CLASH_LIST}
   - name: ${HOST_TAG}-TUIC
     type: tuic
-    server: \"${RAW_IP}\"
+    server: ${RAW_IP}
     port: ${P_TUIC}
     uuid: ${UUID}
     password: ${PASS}
@@ -583,7 +543,7 @@ refresh_nodes() {
         CLASH_LIST="${CLASH_LIST}
   - name: ${HOST_TAG}-AnyTLS
     type: anytls
-    server: \"${RAW_IP}\"
+    server: ${RAW_IP}
     port: ${P_ANYTLS}
     password: ${PASS}
     sni: ${TLS_SNI}
