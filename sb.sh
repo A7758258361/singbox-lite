@@ -1,8 +1,8 @@
 #!/bin/sh
 # ==============================================================================
-# sing-box-lite 极简四协议部署与管理脚本 (Alpine / Debian / Ubuntu 全兼容版)
+# sing-box-lite 极简四协议部署与管理脚本 (Alpine / Debian / Ubuntu 全兼容终极版)
 # 集成协议: VLESS-REALITY-Vision / Hysteria 2 / TUIC v5 / AnyTLS
-# 特性: 1C64M 防 OOM + 核心智能复用 + 协议独立增删 + 端口修改 + 订阅生成
+# 特性: 1C64M 防 OOM + 端口防冲突检测 + 协议独立增删 + 端口修改 + 订阅生成
 # ==============================================================================
 
 export TMPDIR="/var/tmp"
@@ -29,13 +29,13 @@ if [ -f /etc/alpine-release ]; then
     OS_TYPE="alpine"
     echo -e "${YELLOW}[1/6] 检测到 Alpine Linux，正在检查基础依赖...${NC}"
     apk update >/dev/null 2>&1 || true
-    apk add --no-cache curl wget tar openssl ca-certificates jq iproute2 iptables >/dev/null 2>&1 || true
+    apk add --no-cache curl wget tar openssl ca-certificates jq iproute2 iptables psmisc >/dev/null 2>&1 || true
 else
     OS_TYPE="debian"
     echo -e "${YELLOW}[1/6] 检测到 Debian/Ubuntu 系统，正在检查基础依赖...${NC}"
     export DEBIAN_FRONTEND=noninteractive
     apt-get update -y >/dev/null 2>&1 || true
-    apt-get install -y curl wget tar openssl ca-certificates jq iproute2 iptables >/dev/null 2>&1 || true
+    apt-get install -y curl wget tar openssl ca-certificates jq iproute2 iptables psmisc >/dev/null 2>&1 || true
 fi
 
 # 2. 内核网络参数优化 (修复双栈监听仅 IPv6 问题 + 开启 BBR + QUIC 缓冲区)
@@ -56,13 +56,16 @@ net.ipv4.tcp_congestion_control = bbr
 EOF
 sysctl --system >/dev/null 2>&1 || true
 
-# 3. 架构识别与获取 sing-box 核心 (支持直接复用已有核心 + 防 Text file busy)
+# 3. 架构识别与获取 sing-box 核心 (彻底清理旧守护服务与残留进程)
 echo -e "${YELLOW}[3/6] 正在检查/获取 sing-box 核心...${NC}"
 
-# 先停止可能正在运行的旧进程，释放内存与二进制文件锁
-rc-service sing-box stop >/dev/null 2>&1 || true
-systemctl stop sing-box >/dev/null 2>&1 || true
-pkill -9 -x sing-box >/dev/null 2>&1 || killall -9 sing-box >/dev/null 2>&1 || true
+# 停止一切可能冲突的旧服务(含其他脚本创建的 singbox / sing-box 服务)
+for svc in sing-box singbox sb; do
+    rc-service "$svc" stop >/dev/null 2>&1 || true
+    systemctl stop "$svc" >/dev/null 2>&1 || true
+done
+killall -9 sing-box >/dev/null 2>&1 || pkill -9 -f "sing-box" >/dev/null 2>&1 || true
+sleep 1
 
 # 如果其他路径(如 /usr/bin/sing-box)已有核心但 /usr/local/bin 没有，自动复制过来
 if [ ! -x "$SB_BIN" ] && command -v sing-box >/dev/null 2>&1; then
@@ -123,7 +126,6 @@ if [ "$NEED_DOWNLOAD" -eq 1 ]; then
         exit 1
     fi
 
-    # 关键修复: 先 rm -f 解锁旧 inode，再移动新二进制，彻底杜绝 Text file busy
     rm -f "$SB_BIN"
     mv -f "$EXTRACTED_BIN" "$SB_BIN"
     chmod +x "$SB_BIN"
@@ -131,7 +133,7 @@ if [ "$NEED_DOWNLOAD" -eq 1 ]; then
     echo -e "${GREEN}已成功安装 sing-box v${SB_VER}${NC}"
 fi
 
-# 4. 生成密钥、证书与端口元数据
+# 4. 生成密钥、证书与防冲突随机端口
 echo -e "${YELLOW}[4/6] 正在生成密钥、自签证书与初始配置...${NC}"
 UUID=$("$SB_BIN" generate uuid 2>/dev/null)
 [ -z "$UUID" ] && UUID=$(cat /proc/sys/kernel/random/uuid)
@@ -145,17 +147,30 @@ KEYPAIR=$("$SB_BIN" generate reality-keypair 2>/dev/null)
 PRIVATE_KEY=$(echo "$KEYPAIR" | awk '/PrivateKey/ {print $2}' | tr -d '\r\n ')
 PUBLIC_KEY=$(echo "$KEYPAIR" | awk '/PublicKey/ {print $2}' | tr -d '\r\n ')
 
-# 关键修复: 加上 -noout 生成纯净私钥，防止附带 EC PARAMETERS 导致 TLS 握手异常
 openssl ecparam -name prime256v1 -genkey -noout -out /etc/sing-box/private.key 2>/dev/null
 openssl req -new -x509 -days 3650 -key /etc/sing-box/private.key -out /etc/sing-box/cert.pem \
     -subj "/CN=${TLS_SNI}" -addext "subjectAltName=DNS:${TLS_SNI}" 2>/dev/null || \
 openssl req -new -x509 -days 3650 -key /etc/sing-box/private.key -out /etc/sing-box/cert.pem \
     -subj "/CN=${TLS_SNI}" 2>/dev/null
 
-gen_port() {
-    shuf -i 20000-55000 -n 1 2>/dev/null || awk 'BEGIN{srand(); print int(20000+rand()*35000)}'
+# 使用 /dev/urandom 生成真随机且未被占用的起始端口
+get_free_base_port() {
+    while true; do
+        RAND_NUM=$(od -An -N2 -tu2 /dev/urandom | tr -d ' ')
+        BASE_P=$((20000 + (RAND_NUM % 35000)))
+        P1=$BASE_P
+        P2=$((BASE_P + 1))
+        P3=$((BASE_P + 2))
+        P4=$((BASE_P + 3))
+        if ! ss -tuln 2>/dev/null | grep -Eq ":(${P1}|${P2}|${P3}|${P4}) "; then
+            echo "$BASE_P"
+            return
+        fi
+    done
 }
-PORT_REALITY="${PORT_REALITY:-$(gen_port)}"
+
+BASE_PORT=$(get_free_base_port)
+PORT_REALITY="${PORT_REALITY:-$BASE_PORT}"
 PORT_HY2="${PORT_HY2:-$((PORT_REALITY + 1))}"
 PORT_TUIC="${PORT_TUIC:-$((PORT_REALITY + 2))}"
 PORT_ANYTLS="${PORT_ANYTLS:-$((PORT_REALITY + 3))}"
@@ -309,11 +324,9 @@ cat > "$CONFIG_FILE" << EOF
 }
 EOF
 
-# 兼容性自检: 若旧版核心不支持 route.rules.action，自动回退基础路由
 if ! "$SB_BIN" check -c "$CONFIG_FILE" >/dev/null 2>&1; then
     jq 'del(.route.rules)' "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
 fi
-# 若本机旧核心版本低于 1.12 不支持 anytls，自动剔除 anytls 确保剩余 3 协议正常启动
 if ! "$SB_BIN" check -c "$CONFIG_FILE" >/dev/null 2>&1; then
     jq 'del(.inbounds[] | select(.tag == "anytls-in"))' "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
 fi
@@ -384,6 +397,20 @@ YELLOW='\033[0;33m'
 CYAN='\033[0;36m'
 NC='\033[0m'
 
+is_running() {
+    pidof sing-box >/dev/null 2>&1 || ps aux 2>/dev/null | grep "[s]ing-box run" >/dev/null 2>&1
+}
+
+kill_all_sb() {
+    for svc in sing-box singbox; do
+        rc-service "$svc" stop >/dev/null 2>&1 || true
+        systemctl stop "$svc" >/dev/null 2>&1 || true
+    done
+    killall -9 sing-box >/dev/null 2>&1 || pkill -9 -f "sing-box" >/dev/null 2>&1 || true
+    rm -f /run/sing-box.pid /var/run/sing-box.pid 2>/dev/null || true
+    sleep 1
+}
+
 restart_sb() {
     if ! "$SB_BIN" check -c "$CONFIG_FILE" >/dev/null 2>&1; then
         echo -e "${RED}[错误] 配置文件校验未通过，具体原因如下：${NC}"
@@ -391,27 +418,23 @@ restart_sb() {
         return 1
     fi
 
-    # 先彻底清理可能冲突的残留进程
+    # 彻底清理旧进程，释放所有被占用的端口
+    kill_all_sb
+
     if [ -f /etc/alpine-release ] && command -v rc-service >/dev/null 2>&1; then
-        rc-service sing-box stop >/dev/null 2>&1 || true
-        pkill -9 -x sing-box >/dev/null 2>&1 || true
         rc-service sing-box start >/dev/null 2>&1 || true
     elif command -v systemctl >/dev/null 2>&1; then
-        systemctl stop sing-box >/dev/null 2>&1 || true
-        pkill -9 -x sing-box >/dev/null 2>&1 || true
         systemctl start sing-box >/dev/null 2>&1 || true
-    else
-        pkill -9 -x sing-box >/dev/null 2>&1 || true
     fi
 
     sleep 1
-    # 如果 OpenRC/systemd 未能拉起(如特殊容器环境)，自动使用 nohup 后台兜底启动
-    if ! pgrep -x "sing-box" >/dev/null 2>&1; then
+    # 如果 OpenRC/systemd 未能拉起，自动使用 nohup 后台直启兜底
+    if ! is_running; then
         GOMEMLIMIT="28MiB" GOGC="15" GOMAXPROCS="1" nohup "$SB_BIN" run -c "$CONFIG_FILE" >/var/tmp/sing-box.log 2>&1 &
         sleep 1
     fi
 
-    if pgrep -x "sing-box" >/dev/null 2>&1; then
+    if is_running; then
         echo -e "${GREEN}[成功] sing-box 服务已启动并正常运行！${NC}"
     else
         echo -e "${RED}[失败] sing-box 未能启动，报错信息如下：${NC}"
@@ -763,14 +786,12 @@ while true; do
             printf "确认彻底卸载 sing-box 吗？[y/N]: "
             read -r confirm
             if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
-                rc-service sing-box stop 2>/dev/null || true
+                kill_all_sb
                 rc-update del sing-box default 2>/dev/null || true
                 rm -f /etc/init.d/sing-box
-                systemctl stop sing-box 2>/dev/null || true
                 systemctl disable sing-box 2>/dev/null || true
                 rm -f /etc/systemd/system/sing-box.service
                 systemctl daemon-reload 2>/dev/null || true
-                pkill -9 -x sing-box 2>/dev/null || true
                 rm -rf /etc/sing-box "$SB_BIN" "$SB_CMD" "$NODES_FILE"
                 echo -e "${GREEN}sing-box 已彻底卸载！${NC}"
                 exit 0
