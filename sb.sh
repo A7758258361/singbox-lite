@@ -82,33 +82,63 @@ if [ "$NEED_DOWNLOAD" -eq 1 ]; then
     echo -e "${CYAN}正在下载 sing-box v${SB_VER} (${ARCH})...${NC}"
     cd /var/tmp || exit 1
     rm -rf /var/tmp/sing-box*
-    DL_OK=0
+    sync; echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
 
     if [ "$OS_TYPE" = "alpine" ]; then
-        MUSL_URL="https://github.com/SagerNet/sing-box/releases/download/v${SB_VER}/sing-box-${SB_VER}-linux-${ARCH}-musl.tar.gz"
-        if curl -fsSLm 60 "$MUSL_URL" -o sing-box.tar.gz 2>/dev/null || wget -q -T 60 "$MUSL_URL" -O sing-box.tar.gz 2>/dev/null; then
-            [ -s sing-box.tar.gz ] && DL_OK=1
+        PKG_LIST="sing-box-${SB_VER}-linux-${ARCH}-musl.tar.gz sing-box-${SB_VER}-linux-${ARCH}.tar.gz"
+    else
+        PKG_LIST="sing-box-${SB_VER}-linux-${ARCH}.tar.gz"
+    fi
+
+    MIRRORS="
+https://github.com/SagerNet/sing-box/releases/download/v${SB_VER}
+https://gh-proxy.com/https://github.com/SagerNet/sing-box/releases/download/v${SB_VER}
+https://ghfast.top/https://github.com/SagerNet/sing-box/releases/download/v${SB_VER}
+https://ghproxy.net/https://github.com/SagerNet/sing-box/releases/download/v${SB_VER}
+"
+
+    EXTRACTED_BIN=""
+    for pkg in $PKG_LIST; do
+        for base_url in $MIRRORS; do
+            [ -z "$base_url" ] && continue
+            DL_URL="${base_url}/${pkg}"
+            rm -rf /var/tmp/sing-box*
+            if curl -fsSL --connect-timeout 10 -m 180 "$DL_URL" 2>/dev/null | tar -xz -C /var/tmp 2>/dev/null || \
+               wget -q -T 15 -O - "$DL_URL" 2>/dev/null | tar -xz -C /var/tmp 2>/dev/null; then
+                EXTRACTED_BIN=$(find /var/tmp -maxdepth 2 -type f -name "sing-box" | head -n 1)
+                if [ -n "$EXTRACTED_BIN" ] && [ -s "$EXTRACTED_BIN" ]; then
+                    chmod +x "$EXTRACTED_BIN"
+                    if "$EXTRACTED_BIN" version >/dev/null 2>&1; then
+                        break 2
+                    fi
+                fi
+            fi
+            EXTRACTED_BIN=""
+        done
+    done
+
+    if [ -z "$EXTRACTED_BIN" ] && [ "$OS_TYPE" = "alpine" ]; then
+        echo -e "${YELLOW}直连与镜像下载失败，正在通过 Alpine 官方源安装...${NC}"
+        apk add --no-cache sing-box >/dev/null 2>&1 || \
+        apk add --no-cache sing-box --repository=http://dl-cdn.alpinelinux.org/alpine/edge/community >/dev/null 2>&1 || true
+        if command -v sing-box >/dev/null 2>&1; then
+            EXTRACTED_BIN=$(command -v sing-box)
         fi
     fi
 
-    if [ "$DL_OK" -eq 0 ]; then
-        STD_URL="https://github.com/SagerNet/sing-box/releases/download/v${SB_VER}/sing-box-${SB_VER}-linux-${ARCH}.tar.gz"
-        if curl -fsSLm 60 "$STD_URL" -o sing-box.tar.gz 2>/dev/null || wget -q -T 60 "$STD_URL" -O sing-box.tar.gz 2>/dev/null; then
-            [ -s sing-box.tar.gz ] && DL_OK=1
-        fi
-    fi
-
-    if [ "$DL_OK" -eq 0 ] || ! tar -xzf sing-box.tar.gz 2>/dev/null; then
+    if [ -z "$EXTRACTED_BIN" ] || [ ! -s "$EXTRACTED_BIN" ]; then
         echo -e "${RED}[错误] 下载或解压 sing-box 失败！${NC}"
         rm -rf /var/tmp/sing-box*
         exit 1
     fi
 
-    EXTRACTED_BIN=$(find /var/tmp -maxdepth 2 -type f -name "sing-box" | head -n 1)
-    rm -f "$SB_BIN"
-    mv -f "$EXTRACTED_BIN" "$SB_BIN"
+    if [ "$EXTRACTED_BIN" != "$SB_BIN" ]; then
+        rm -f "$SB_BIN"
+        mv -f "$EXTRACTED_BIN" "$SB_BIN" 2>/dev/null || cp -f "$EXTRACTED_BIN" "$SB_BIN"
+    fi
     chmod +x "$SB_BIN"
     rm -rf /var/tmp/sing-box*
+    sync; echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
     echo -e "${GREEN}已成功安装 sing-box v${SB_VER}${NC}"
 fi
 
