@@ -1,11 +1,9 @@
 #!/bin/sh
 # ==============================================================================
-# sing-box-lite 极简多协议部署与管理脚本 (Alpine / Debian / Ubuntu 双栈优化版)
+# sing-box-lite 极简四协议部署与管理脚本 (Alpine / Debian / Ubuntu 全兼容版)
 # 集成协议: VLESS-REALITY-Vision / Hysteria 2 / TUIC v5 / AnyTLS
-# 特性: 1C64M 极限防 OOM + 协议独立增删 + 端口修改 + 自动生成订阅与 Clash 配置
+# 特性: 1C64M 防 OOM + 核心智能复用 + 协议独立增删 + 端口修改 + 订阅生成
 # ==============================================================================
-
-set -e
 
 export TMPDIR="/var/tmp"
 mkdir -p /var/tmp /etc/sing-box
@@ -29,15 +27,15 @@ echo -e "${CYAN}========================================================${NC}"
 # 1. 环境识别与基础依赖安装
 if [ -f /etc/alpine-release ]; then
     OS_TYPE="alpine"
-    echo -e "${YELLOW}[1/6] 检测到 Alpine Linux，正在安装依赖...${NC}"
-    apk update >/dev/null 2>&1
-    apk add --no-cache curl wget tar openssl ca-certificates jq iproute2 iptables coreutils >/dev/null 2>&1
+    echo -e "${YELLOW}[1/6] 检测到 Alpine Linux，正在检查基础依赖...${NC}"
+    apk update >/dev/null 2>&1 || true
+    apk add --no-cache curl wget tar openssl ca-certificates jq iproute2 iptables >/dev/null 2>&1 || true
 else
     OS_TYPE="debian"
-    echo -e "${YELLOW}[1/6] 检测到 Debian/Ubuntu 系统，正在安装依赖...${NC}"
+    echo -e "${YELLOW}[1/6] 检测到 Debian/Ubuntu 系统，正在检查基础依赖...${NC}"
     export DEBIAN_FRONTEND=noninteractive
-    apt-get update -y >/dev/null 2>&1
-    apt-get install -y curl wget tar openssl ca-certificates jq iproute2 iptables coreutils >/dev/null 2>&1
+    apt-get update -y >/dev/null 2>&1 || true
+    apt-get install -y curl wget tar openssl ca-certificates jq iproute2 iptables >/dev/null 2>&1 || true
 fi
 
 # 2. 内核网络参数优化 (修复双栈监听仅 IPv6 问题 + 开启 BBR + QUIC 缓冲区)
@@ -48,6 +46,7 @@ sysctl -w net.core.wmem_max=2500000 >/dev/null 2>&1 || true
 sysctl -w net.core.default_qdisc=fq >/dev/null 2>&1 || true
 sysctl -w net.ipv4.tcp_congestion_control=bbr >/dev/null 2>&1 || true
 
+mkdir -p /etc/sysctl.d
 cat > /etc/sysctl.d/99-singbox.conf << 'EOF' 2>/dev/null || true
 net.ipv6.bindv6only = 0
 net.core.rmem_max = 2500000
@@ -57,66 +56,102 @@ net.ipv4.tcp_congestion_control = bbr
 EOF
 sysctl --system >/dev/null 2>&1 || true
 
-# 3. 架构识别与下载 sing-box 核心 (规避 GitHub API 403 限流)
-echo -e "${YELLOW}[3/6] 正在获取 sing-box 核心...${NC}"
-ARCH_RAW=$(uname -m)
-case "$ARCH_RAW" in
-    x86_64|amd64) ARCH="amd64" ;;
-    aarch64|arm64) ARCH="arm64" ;;
-    armv7l) ARCH="armv7" ;;
-    *) echo -e "${RED}不支持的 CPU 架构: $ARCH_RAW${NC}"; exit 1 ;;
-esac
+# 3. 架构识别与获取 sing-box 核心 (支持直接复用已有核心 + 防 Text file busy)
+echo -e "${YELLOW}[3/6] 正在检查/获取 sing-box 核心...${NC}"
 
-# 优先通过重定向 URL 获取最新稳定版本号，避免 GitHub API 403 限流
-SB_VER=$(curl -fsSLI -o /dev/null -w '%{url_effective}' https://github.com/SagerNet/sing-box/releases/latest 2>/dev/null | awk -F'/' '{print $NF}' | sed 's/^v//')
-if [ -z "$SB_VER" ] || [ "$SB_VER" = "latest" ]; then
-    SB_VER=$(curl -fsSL https://api.github.com/repos/SagerNet/sing-box/releases/latest 2>/dev/null | jq -r '.tag_name // empty' | sed 's/^v//')
+# 先停止可能正在运行的旧进程，释放内存与二进制文件锁
+rc-service sing-box stop >/dev/null 2>&1 || true
+systemctl stop sing-box >/dev/null 2>&1 || true
+pkill -9 -x sing-box >/dev/null 2>&1 || killall -9 sing-box >/dev/null 2>&1 || true
+
+# 如果其他路径(如 /usr/bin/sing-box)已有核心但 /usr/local/bin 没有，自动复制过来
+if [ ! -x "$SB_BIN" ] && command -v sing-box >/dev/null 2>&1; then
+    EXIST_BIN=$(command -v sing-box)
+    cp -f "$EXIST_BIN" "$SB_BIN" 2>/dev/null || true
+    chmod +x "$SB_BIN" 2>/dev/null || true
 fi
-# 兜底使用稳定支持 AnyTLS 的 1.14.4 版本
-[ -z "$SB_VER" ] && SB_VER="1.14.4"
 
-cd /var/tmp
-rm -rf /var/tmp/sing-box*
-DL_SUCCESS=0
+NEED_DOWNLOAD=1
+if [ -x "$SB_BIN" ] && "$SB_BIN" version >/dev/null 2>&1; then
+    CUR_VER=$("$SB_BIN" version 2>/dev/null | awk '/sing-box version/ {print $3}' | head -n 1)
+    echo -e "${GREEN}检测到本机已安装 sing-box v${CUR_VER}，直接复用现有核心！${NC}"
+    NEED_DOWNLOAD=0
+fi
 
-if [ "$OS_TYPE" = "alpine" ]; then
-    MUSL_URL="https://github.com/SagerNet/sing-box/releases/download/v${SB_VER}/sing-box-${SB_VER}-linux-${ARCH}-musl.tar.gz"
-    if curl -fsSL "$MUSL_URL" -o sing-box.tar.gz 2>/dev/null; then
-        DL_SUCCESS=1
+if [ "$NEED_DOWNLOAD" -eq 1 ]; then
+    ARCH_RAW=$(uname -m)
+    case "$ARCH_RAW" in
+        x86_64|amd64) ARCH="amd64" ;;
+        aarch64|arm64) ARCH="arm64" ;;
+        armv7l|armv7*) ARCH="armv7" ;;
+        *) echo -e "${RED}不支持的 CPU 架构: $ARCH_RAW${NC}"; exit 1 ;;
+    esac
+
+    SB_VER=$(curl -fsSLm 5 https://api.github.com/repos/SagerNet/sing-box/releases/latest 2>/dev/null | jq -r '.tag_name // empty' 2>/dev/null | sed 's/^v//')
+    if ! echo "$SB_VER" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+        SB_VER="1.14.4"
     fi
-fi
 
-if [ "$DL_SUCCESS" -eq 0 ]; then
-    STD_URL="https://github.com/SagerNet/sing-box/releases/download/v${SB_VER}/sing-box-${SB_VER}-linux-${ARCH}.tar.gz"
-    curl -fsSL "$STD_URL" -o sing-box.tar.gz || wget -q "$STD_URL" -O sing-box.tar.gz
-fi
+    echo -e "${CYAN}正在下载 sing-box v${SB_VER} (${ARCH})...${NC}"
+    cd /var/tmp || exit 1
+    rm -rf /var/tmp/sing-box*
+    DL_OK=0
 
-tar -xzf sing-box.tar.gz
-cp -f sing-box-*/sing-box "$SB_BIN"
-chmod +x "$SB_BIN"
-rm -rf /var/tmp/sing-box*
-echo -e "${GREEN}已成功安装 sing-box v${SB_VER}${NC}"
+    if [ "$OS_TYPE" = "alpine" ]; then
+        MUSL_URL="https://github.com/SagerNet/sing-box/releases/download/v${SB_VER}/sing-box-${SB_VER}-linux-${ARCH}-musl.tar.gz"
+        if curl -fsSLm 60 "$MUSL_URL" -o sing-box.tar.gz 2>/dev/null || wget -q -T 60 "$MUSL_URL" -O sing-box.tar.gz 2>/dev/null; then
+            [ -s sing-box.tar.gz ] && DL_OK=1
+        fi
+    fi
+
+    if [ "$DL_OK" -eq 0 ]; then
+        STD_URL="https://github.com/SagerNet/sing-box/releases/download/v${SB_VER}/sing-box-${SB_VER}-linux-${ARCH}.tar.gz"
+        if curl -fsSLm 60 "$STD_URL" -o sing-box.tar.gz 2>/dev/null || wget -q -T 60 "$STD_URL" -O sing-box.tar.gz 2>/dev/null; then
+            [ -s sing-box.tar.gz ] && DL_OK=1
+        fi
+    fi
+
+    if [ "$DL_OK" -eq 0 ] || ! tar -xzf sing-box.tar.gz 2>/dev/null; then
+        echo -e "${RED}[错误] 下载或解压 sing-box 失败，请检查机器连接 GitHub 的网络！${NC}"
+        rm -rf /var/tmp/sing-box*
+        exit 1
+    fi
+
+    EXTRACTED_BIN=$(find /var/tmp -maxdepth 2 -type f -name "sing-box" | head -n 1)
+    if [ -z "$EXTRACTED_BIN" ]; then
+        echo -e "${RED}[错误] 解压后未找到 sing-box 二进制文件！${NC}"
+        exit 1
+    fi
+
+    # 关键修复: 先 rm -f 解锁旧 inode，再移动新二进制，彻底杜绝 Text file busy
+    rm -f "$SB_BIN"
+    mv -f "$EXTRACTED_BIN" "$SB_BIN"
+    chmod +x "$SB_BIN"
+    rm -rf /var/tmp/sing-box*
+    echo -e "${GREEN}已成功安装 sing-box v${SB_VER}${NC}"
+fi
 
 # 4. 生成密钥、证书与端口元数据
-echo -e "${YELLOW}[4/6] 正在生成密钥、SAN 自签证书与初始配置...${NC}"
-UUID=$("$SB_BIN" generate uuid)
-PASS=$(openssl rand -hex 8)
-SHORT_ID=$(openssl rand -hex 4)
+echo -e "${YELLOW}[4/6] 正在生成密钥、自签证书与初始配置...${NC}"
+UUID=$("$SB_BIN" generate uuid 2>/dev/null)
+[ -z "$UUID" ] && UUID=$(cat /proc/sys/kernel/random/uuid)
+
+PASS=$(openssl rand -hex 8 2>/dev/null || head -c 8 /dev/urandom | od -An -tx1 | tr -d ' \n')
+SHORT_ID=$(openssl rand -hex 4 2>/dev/null || head -c 4 /dev/urandom | od -An -tx1 | tr -d ' \n')
 REALITY_SNI="${REALITY_SNI:-www.apple.com}"
 TLS_SNI="${TLS_SNI:-www.bing.com}"
 
-KEYPAIR=$("$SB_BIN" generate reality-keypair)
-PRIVATE_KEY=$(echo "$KEYPAIR" | awk -F': ' '/PrivateKey/ {print $2}' | tr -d '\r\n ')
-PUBLIC_KEY=$(echo "$KEYPAIR" | awk -F': ' '/PublicKey/ {print $2}' | tr -d '\r\n ')
+KEYPAIR=$("$SB_BIN" generate reality-keypair 2>/dev/null)
+PRIVATE_KEY=$(echo "$KEYPAIR" | awk '/PrivateKey/ {print $2}' | tr -d '\r\n ')
+PUBLIC_KEY=$(echo "$KEYPAIR" | awk '/PublicKey/ {print $2}' | tr -d '\r\n ')
 
-# 生成带 SAN 扩展的 ECDSA P-256 自签证书，解决现代客户端 TLS 握手失败问题
-openssl ecparam -genkey -name prime256v1 -out /etc/sing-box/private.key 2>/dev/null
+# 关键修复: 加上 -noout 生成纯净私钥，防止附带 EC PARAMETERS 导致 TLS 握手异常
+openssl ecparam -name prime256v1 -genkey -noout -out /etc/sing-box/private.key 2>/dev/null
 openssl req -new -x509 -days 3650 -key /etc/sing-box/private.key -out /etc/sing-box/cert.pem \
     -subj "/CN=${TLS_SNI}" -addext "subjectAltName=DNS:${TLS_SNI}" 2>/dev/null || \
 openssl req -new -x509 -days 3650 -key /etc/sing-box/private.key -out /etc/sing-box/cert.pem \
     -subj "/CN=${TLS_SNI}" 2>/dev/null
 
-# 生成互不冲突的 4 个随机端口 (支持环境变量预设)
 gen_port() {
     shuf -i 20000-55000 -n 1 2>/dev/null || awk 'BEGIN{srand(); print int(20000+rand()*35000)}'
 }
@@ -125,14 +160,12 @@ PORT_HY2="${PORT_HY2:-$((PORT_REALITY + 1))}"
 PORT_TUIC="${PORT_TUIC:-$((PORT_REALITY + 2))}"
 PORT_ANYTLS="${PORT_ANYTLS:-$((PORT_REALITY + 3))}"
 
-# 检测是否支持 IPv6 监听，决定使用 "::" 还是 "0.0.0.0"
 if [ -f /proc/net/if_inet6 ] && [ -s /proc/net/if_inet6 ]; then
     LISTEN_ADDR="::"
 else
     LISTEN_ADDR="0.0.0.0"
 fi
 
-# 保存元数据至 /etc/sing-box/meta.json，供后续单协议恢复/修改端口/生成链接使用
 jq -n \
     --arg uuid "$UUID" \
     --arg pass "$PASS" \
@@ -163,7 +196,6 @@ jq -n \
         }
     }' > "$META_FILE"
 
-# 写入初始 4 协议配置文件 (采用 sing-box 1.12~1.14+ 通用标准结构)
 cat > "$CONFIG_FILE" << EOF
 {
   "log": {
@@ -277,14 +309,18 @@ cat > "$CONFIG_FILE" << EOF
 }
 EOF
 
-# 如果当前下载的核心版本较旧不支持 route.rules.action，自动降级为基础路由确保 100% 启动
+# 兼容性自检: 若旧版核心不支持 route.rules.action，自动回退基础路由
 if ! "$SB_BIN" check -c "$CONFIG_FILE" >/dev/null 2>&1; then
     jq 'del(.route.rules)' "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
 fi
+# 若本机旧核心版本低于 1.12 不支持 anytls，自动剔除 anytls 确保剩余 3 协议正常启动
+if ! "$SB_BIN" check -c "$CONFIG_FILE" >/dev/null 2>&1; then
+    jq 'del(.inbounds[] | select(.tag == "anytls-in"))' "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
+fi
 
-# 5. 配置系统守护服务 (含 1C64M 内存硬限与 CPU 降权保护)
-echo -e "${YELLOW}[5/6] 正在配置后台守护进程 (GOMEMLIMIT=28MiB)...${NC}"
-if [ "$OS_TYPE" = "alpine" ]; then
+# 5. 配置系统守护服务 (OpenRC / systemd / nohup 三模自适应 + 28MiB 内存硬限)
+echo -e "${YELLOW}[5/6] 正在配置后台守护服务 (GOMEMLIMIT=28MiB)...${NC}"
+if [ -f /etc/alpine-release ] && command -v rc-service >/dev/null 2>&1; then
     cat > /etc/init.d/sing-box << 'EOF'
 #!/sbin/openrc-run
 name="sing-box"
@@ -307,8 +343,7 @@ start_pre() {
 EOF
     chmod +x /etc/init.d/sing-box
     rc-update add sing-box default >/dev/null 2>&1 || true
-    rc-service sing-box restart
-else
+elif command -v systemctl >/dev/null 2>&1; then
     cat > /etc/systemd/system/sing-box.service << 'EOF'
 [Unit]
 Description=sing-box service (64MB Low-RAM Optimized)
@@ -329,13 +364,13 @@ RestartSec=5s
 [Install]
 WantedBy=multi-user.target
 EOF
-    systemctl daemon-reload
+    systemctl daemon-reload >/dev/null 2>&1 || true
     systemctl enable sing-box >/dev/null 2>&1 || true
-    systemctl restart sing-box
 fi
 
 # 6. 生成 /usr/local/bin/sb 快捷管理面板 (含删除/恢复单条协议功能)
 echo -e "${YELLOW}[6/6] 正在安装 sb 快捷管理命令...${NC}"
+rm -f "$SB_CMD"
 cat > "$SB_CMD" << 'EOF'
 #!/bin/sh
 CONFIG_FILE="/etc/sing-box/config.json"
@@ -351,20 +386,36 @@ NC='\033[0m'
 
 restart_sb() {
     if ! "$SB_BIN" check -c "$CONFIG_FILE" >/dev/null 2>&1; then
-        echo -e "${RED}[错误] 配置文件校验未通过，请检查配置！${NC}"
+        echo -e "${RED}[错误] 配置文件校验未通过，具体原因如下：${NC}"
         "$SB_BIN" check -c "$CONFIG_FILE"
         return 1
     fi
-    if [ -f /etc/alpine-release ]; then
-        rc-service sing-box restart >/dev/null 2>&1
+
+    # 先彻底清理可能冲突的残留进程
+    if [ -f /etc/alpine-release ] && command -v rc-service >/dev/null 2>&1; then
+        rc-service sing-box stop >/dev/null 2>&1 || true
+        pkill -9 -x sing-box >/dev/null 2>&1 || true
+        rc-service sing-box start >/dev/null 2>&1 || true
+    elif command -v systemctl >/dev/null 2>&1; then
+        systemctl stop sing-box >/dev/null 2>&1 || true
+        pkill -9 -x sing-box >/dev/null 2>&1 || true
+        systemctl start sing-box >/dev/null 2>&1 || true
     else
-        systemctl restart sing-box >/dev/null 2>&1
+        pkill -9 -x sing-box >/dev/null 2>&1 || true
     fi
+
     sleep 1
+    # 如果 OpenRC/systemd 未能拉起(如特殊容器环境)，自动使用 nohup 后台兜底启动
+    if ! pgrep -x "sing-box" >/dev/null 2>&1; then
+        GOMEMLIMIT="28MiB" GOGC="15" GOMAXPROCS="1" nohup "$SB_BIN" run -c "$CONFIG_FILE" >/var/tmp/sing-box.log 2>&1 &
+        sleep 1
+    fi
+
     if pgrep -x "sing-box" >/dev/null 2>&1; then
-        echo -e "${GREEN}[成功] sing-box 服务已重启并正常运行！${NC}"
+        echo -e "${GREEN}[成功] sing-box 服务已启动并正常运行！${NC}"
     else
-        echo -e "${RED}[警告] sing-box 进程未启动，请使用菜单查看日志！${NC}"
+        echo -e "${RED}[失败] sing-box 未能启动，报错信息如下：${NC}"
+        "$SB_BIN" run -c "$CONFIG_FILE"
     fi
 }
 
@@ -378,13 +429,14 @@ open_port() {
 }
 
 get_server_ip() {
-    # 优先获取纯 IPv4 地址 (防止双栈小鸡返回未加括号的 IPv6 导致链接损坏)
-    IP4=$(curl -s4m4 https://api.ipify.org 2>/dev/null || curl -s4m4 https://ip.sb 2>/dev/null || curl -s4m4 https://ifconfig.me 2>/dev/null | tr -d '\r\n ')
+    IP4=$(curl -s4m4 https://api.ipify.org 2>/dev/null || curl -s4m4 https://ip.sb 2>/dev/null || curl -s4m4 https://ifconfig.me 2>/dev/null)
+    IP4=$(echo "$IP4" | tr -d '\r\n ')
     if echo "$IP4" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
         echo "$IP4"
         return
     fi
-    IP6=$(curl -s6m4 https://api64.ipify.org 2>/dev/null || curl -s6m4 https://ip.sb 2>/dev/null | tr -d '\r\n ')
+    IP6=$(curl -s6m4 https://api64.ipify.org 2>/dev/null || curl -s6m4 https://ip.sb 2>/dev/null)
+    IP6=$(echo "$IP6" | tr -d '\r\n ')
     if [ -n "$IP6" ]; then
         echo "[${IP6}]"
     else
@@ -400,7 +452,8 @@ refresh_nodes() {
 
     SERVER_IP=$(get_server_ip)
     RAW_IP=$(echo "$SERVER_IP" | tr -d '[]')
-    HOST_TAG=$(hostname | tr -d '\r\n ')
+    HOST_TAG=$(hostname 2>/dev/null | tr -d '\r\n ')
+    [ -z "$HOST_TAG" ] && HOST_TAG="Node"
 
     UUID=$(jq -r '.uuid' "$META_FILE")
     PASS=$(jq -r '.password' "$META_FILE")
@@ -412,7 +465,6 @@ refresh_nodes() {
     URI_LIST=""
     CLASH_LIST="proxies:"
 
-    # 1. 检测 VLESS-REALITY 是否存在
     P_VLESS=$(jq -r '.inbounds[] | select(.tag=="vless-in") | .listen_port // empty' "$CONFIG_FILE")
     if [ -n "$P_VLESS" ]; then
         open_port "$P_VLESS"
@@ -435,7 +487,6 @@ refresh_nodes() {
       short-id: ${SHORT_ID}"
     fi
 
-    # 2. 检测 Hysteria 2 是否存在
     P_HY2=$(jq -r '.inbounds[] | select(.tag=="hy2-in") | .listen_port // empty' "$CONFIG_FILE")
     if [ -n "$P_HY2" ]; then
         open_port "$P_HY2"
@@ -451,7 +502,6 @@ refresh_nodes() {
     skip-cert-verify: true"
     fi
 
-    # 3. 检测 TUIC v5 是否存在
     P_TUIC=$(jq -r '.inbounds[] | select(.tag=="tuic-in") | .listen_port // empty' "$CONFIG_FILE")
     if [ -n "$P_TUIC" ]; then
         open_port "$P_TUIC"
@@ -471,7 +521,6 @@ refresh_nodes() {
     skip-cert-verify: true"
     fi
 
-    # 4. 检测 AnyTLS 是否存在
     P_ANYTLS=$(jq -r '.inbounds[] | select(.tag=="anytls-in") | .listen_port // empty' "$CONFIG_FILE")
     if [ -n "$P_ANYTLS" ]; then
         open_port "$P_ANYTLS"
@@ -680,7 +729,6 @@ show_status() {
     echo -e "${CYAN}-----------------------------------${NC}"
 }
 
-# 支持命令行快捷传参 (如: sb list | sb del tuic | sb restart)
 case "$1" in
     list|nodes) refresh_nodes; exit 0 ;;
     del|delete) delete_protocol "$2"; exit 0 ;;
@@ -715,16 +763,14 @@ while true; do
             printf "确认彻底卸载 sing-box 吗？[y/N]: "
             read -r confirm
             if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
-                if [ -f /etc/alpine-release ]; then
-                    rc-service sing-box stop 2>/dev/null || true
-                    rc-update del sing-box default 2>/dev/null || true
-                    rm -f /etc/init.d/sing-box
-                else
-                    systemctl stop sing-box 2>/dev/null || true
-                    systemctl disable sing-box 2>/dev/null || true
-                    rm -f /etc/systemd/system/sing-box.service
-                    systemctl daemon-reload 2>/dev/null || true
-                fi
+                rc-service sing-box stop 2>/dev/null || true
+                rc-update del sing-box default 2>/dev/null || true
+                rm -f /etc/init.d/sing-box
+                systemctl stop sing-box 2>/dev/null || true
+                systemctl disable sing-box 2>/dev/null || true
+                rm -f /etc/systemd/system/sing-box.service
+                systemctl daemon-reload 2>/dev/null || true
+                pkill -9 -x sing-box 2>/dev/null || true
                 rm -rf /etc/sing-box "$SB_BIN" "$SB_CMD" "$NODES_FILE"
                 echo -e "${GREEN}sing-box 已彻底卸载！${NC}"
                 exit 0
@@ -738,6 +784,6 @@ EOF
 
 chmod +x "$SB_CMD"
 
-# 校验服务并首次输出所有节点信息
+# 启动服务并输出所有节点信息
 "$SB_CMD" restart
 "$SB_CMD" list
