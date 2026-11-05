@@ -4,8 +4,9 @@
 # 特性: 自定义端口 + IPv4/IPv6 入口选择 + 1C64M 防 OOM + 协议动态增删
 # ==============================================================================
 
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 export TMPDIR="/var/tmp"
-mkdir -p /var/tmp /etc/sing-box
+mkdir -p /var/tmp /etc/sing-box /usr/local/bin
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -19,33 +20,74 @@ NODES_FILE="/root/nodes.txt"
 SB_BIN="/usr/local/bin/sing-box"
 SB_CMD="/usr/local/bin/sb"
 
-echo -e "${CYAN}========================================================${NC}"
-echo -e "${CYAN}     sing-box 四协议自定义部署工具 (支持 IPv4/IPv6)    ${NC}"
-echo -e "${CYAN}========================================================${NC}"
+drop_caches_safe() {
+    sync
+    if [ -w /proc/sys/vm/drop_caches ]; then
+        (echo 3 > /proc/sys/vm/drop_caches) 2>/dev/null || true
+    fi
+}
+
+ARCH_RAW=$(uname -m)
+case "$ARCH_RAW" in
+    x86_64|amd64) ARCH="amd64"; JQ_ARCH="amd64" ;;
+    aarch64|arm64) ARCH="arm64"; JQ_ARCH="arm64" ;;
+    armv7l|armv7*) ARCH="armv7"; JQ_ARCH="armhf" ;;
+    *) printf "%b\n" "${RED}不支持的 CPU 架构: $ARCH_RAW${NC}"; exit 1 ;;
+esac
+
+printf "%b\n" "${CYAN}========================================================${NC}"
+printf "%b\n" "${CYAN}     sing-box 四协议自定义部署工具 (支持 IPv4/IPv6)    ${NC}"
+printf "%b\n" "${CYAN}========================================================${NC}"
 
 # 1. 环境识别与基础依赖安装
 if [ -f /etc/alpine-release ]; then
     OS_TYPE="alpine"
-    echo -e "${YELLOW}[1/6] 检测到 Alpine Linux，正在检查基础依赖...${NC}"
+    printf "%b\n" "${YELLOW}[1/6] 检测到 Alpine Linux，正在检查基础依赖...${NC}"
     apk update >/dev/null 2>&1 || true
     apk add --no-cache curl wget tar openssl ca-certificates jq iproute2 iptables psmisc >/dev/null 2>&1 || true
 else
     OS_TYPE="debian"
-    echo -e "${YELLOW}[1/6] 检测到 Debian/Ubuntu 系统，正在检查基础依赖...${NC}"
+    printf "%b\n" "${YELLOW}[1/6] 检测到 Debian/Ubuntu 系统，正在检查基础依赖...${NC}"
     export DEBIAN_FRONTEND=noninteractive
-    apt-get update -y >/dev/null 2>&1 || true
-    apt-get install -y curl wget tar openssl ca-certificates jq iproute2 iptables psmisc >/dev/null 2>&1 || true
+    apt-get -o Acquire::Check-Valid-Until=false update -y >/dev/null 2>&1 || true
+    for pkg in curl wget tar openssl ca-certificates jq iproute2 iptables psmisc; do
+        command -v "${pkg}" >/dev/null 2>&1 || apt-get install -y --no-install-recommends "$pkg" >/dev/null 2>&1 || true
+    done
+fi
+
+# 兜底安装静态 jq 二进制 (防止小内存机器 apt/apk 失败导致 jq 缺失)
+if ! command -v jq >/dev/null 2>&1; then
+    printf "%b\n" "${YELLOW}系统源安装 jq 失败，正在下载静态编译版 jq...${NC}"
+    for jq_url in \
+        "https://github.com/jqlang/jq/releases/download/jq-1.7.1/jq-linux-${JQ_ARCH}" \
+        "https://gh-proxy.com/https://github.com/jqlang/jq/releases/download/jq-1.7.1/jq-linux-${JQ_ARCH}" \
+        "https://ghfast.top/https://github.com/jqlang/jq/releases/download/jq-1.7.1/jq-linux-${JQ_ARCH}" \
+        "https://ghproxy.net/https://github.com/jqlang/jq/releases/download/jq-1.7.1/jq-linux-${JQ_ARCH}"; do
+        if curl -fsSL --connect-timeout 10 -m 60 "$jq_url" -o /usr/local/bin/jq 2>/dev/null || \
+           wget -q -T 15 -O /usr/local/bin/jq "$jq_url" 2>/dev/null; then
+            chmod +x /usr/local/bin/jq
+            if /usr/local/bin/jq --version >/dev/null 2>&1; then
+                break
+            fi
+        fi
+        rm -f /usr/local/bin/jq
+    done
+fi
+
+if ! command -v jq >/dev/null 2>&1; then
+    printf "%b\n" "${RED}[错误] 无法安装或下载 jq，请检查网络！${NC}"
+    exit 1
 fi
 
 # 2. 内核网络参数优化 (BBR + QUIC 缓冲区)
-echo -e "${YELLOW}[2/6] 正在优化内核网络与 BBR 参数...${NC}"
+printf "%b\n" "${YELLOW}[2/6] 正在优化内核网络与 BBR 参数...${NC}"
 sysctl -w net.core.rmem_max=2500000 >/dev/null 2>&1 || true
 sysctl -w net.core.wmem_max=2500000 >/dev/null 2>&1 || true
 sysctl -w net.core.default_qdisc=fq >/dev/null 2>&1 || true
 sysctl -w net.ipv4.tcp_congestion_control=bbr >/dev/null 2>&1 || true
 
 # 3. 架构识别与获取 sing-box 核心
-echo -e "${YELLOW}[3/6] 正在检查/获取 sing-box 核心...${NC}"
+printf "%b\n" "${YELLOW}[3/6] 正在检查/获取 sing-box 核心...${NC}"
 
 for svc in sing-box singbox sb; do
     rc-service "$svc" stop >/dev/null 2>&1 || true
@@ -63,26 +105,18 @@ fi
 NEED_DOWNLOAD=1
 if [ -x "$SB_BIN" ] && "$SB_BIN" version >/dev/null 2>&1; then
     CUR_VER=$("$SB_BIN" version 2>/dev/null | awk '/sing-box version/ {print $3}' | head -n 1)
-    echo -e "${GREEN}检测到本机已安装 sing-box v${CUR_VER}，直接复用现有核心！${NC}"
+    printf "%b\n" "${GREEN}检测到本机已安装 sing-box v${CUR_VER}，直接复用现有核心！${NC}"
     NEED_DOWNLOAD=0
 fi
 
 if [ "$NEED_DOWNLOAD" -eq 1 ]; then
-    ARCH_RAW=$(uname -m)
-    case "$ARCH_RAW" in
-        x86_64|amd64) ARCH="amd64" ;;
-        aarch64|arm64) ARCH="arm64" ;;
-        armv7l|armv7*) ARCH="armv7" ;;
-        *) echo -e "${RED}不支持的 CPU 架构: $ARCH_RAW${NC}"; exit 1 ;;
-    esac
-
     SB_VER=$(curl -fsSLm 5 https://api.github.com/repos/SagerNet/sing-box/releases/latest 2>/dev/null | jq -r '.tag_name // empty' 2>/dev/null | sed 's/^v//')
     [ -z "$SB_VER" ] && SB_VER="1.14.4"
 
-    echo -e "${CYAN}正在下载 sing-box v${SB_VER} (${ARCH})...${NC}"
+    printf "%b\n" "${CYAN}正在下载 sing-box v${SB_VER} (${ARCH})...${NC}"
     cd /var/tmp || exit 1
     rm -rf /var/tmp/sing-box*
-    sync; echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
+    drop_caches_safe
 
     if [ "$OS_TYPE" = "alpine" ]; then
         PKG_LIST="sing-box-${SB_VER}-linux-${ARCH}-musl.tar.gz sing-box-${SB_VER}-linux-${ARCH}.tar.gz"
@@ -118,7 +152,7 @@ https://ghproxy.net/https://github.com/SagerNet/sing-box/releases/download/v${SB
     done
 
     if [ -z "$EXTRACTED_BIN" ] && [ "$OS_TYPE" = "alpine" ]; then
-        echo -e "${YELLOW}直连与镜像下载失败，正在通过 Alpine 官方源安装...${NC}"
+        printf "%b\n" "${YELLOW}直连与镜像下载失败，正在通过 Alpine 官方源安装...${NC}"
         apk add --no-cache sing-box >/dev/null 2>&1 || \
         apk add --no-cache sing-box --repository=http://dl-cdn.alpinelinux.org/alpine/edge/community >/dev/null 2>&1 || true
         if command -v sing-box >/dev/null 2>&1; then
@@ -127,7 +161,7 @@ https://ghproxy.net/https://github.com/SagerNet/sing-box/releases/download/v${SB
     fi
 
     if [ -z "$EXTRACTED_BIN" ] || [ ! -s "$EXTRACTED_BIN" ]; then
-        echo -e "${RED}[错误] 下载或解压 sing-box 失败！${NC}"
+        printf "%b\n" "${RED}[错误] 下载或解压 sing-box 失败！${NC}"
         rm -rf /var/tmp/sing-box*
         exit 1
     fi
@@ -138,13 +172,13 @@ https://ghproxy.net/https://github.com/SagerNet/sing-box/releases/download/v${SB
     fi
     chmod +x "$SB_BIN"
     rm -rf /var/tmp/sing-box*
-    sync; echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
-    echo -e "${GREEN}已成功安装 sing-box v${SB_VER}${NC}"
+    drop_caches_safe
+    printf "%b\n" "${GREEN}已成功安装 sing-box v${SB_VER}${NC}"
 fi
 
 # 4. 交互式选择监听 IP 栈与自定义端口
-echo -e "\n${CYAN}========================================================${NC}"
-echo -e "${YELLOW}请选择服务器监听的 IP 入口 (监听地址):${NC}"
+printf "\n%b\n" "${CYAN}========================================================${NC}"
+printf "%b\n" "${YELLOW}请选择服务器监听的 IP 入口 (监听地址):${NC}"
 echo "  1) 仅 IPv4  (0.0.0.0)      - 推荐纯 IPv4 机器或防止双栈冲突"
 echo "  2) 仅 IPv6  ([::])         - 适用于纯 IPv6 小鸡"
 echo "  3) 双栈监听 (::)           - 同时支持 IPv4 和 IPv6"
@@ -185,7 +219,7 @@ DEF_P2=$(get_free_port)
 DEF_P3=$(get_free_port)
 DEF_P4=$(get_free_port)
 
-echo -e "\n${YELLOW}--- 自定义端口配置 (直接回车则使用随机生成的默认端口) ---${NC}"
+printf "\n%b\n" "${YELLOW}--- 自定义端口配置 (直接回车则使用随机生成的默认端口) ---${NC}"
 printf "请输入 VLESS-REALITY 端口 [默认: %s]: " "$DEF_P1"
 read -r PORT_REALITY
 [ -z "$PORT_REALITY" ] && PORT_REALITY="$DEF_P1"
@@ -202,8 +236,8 @@ printf "请输入 AnyTLS 端口       [默认: %s]: " "$DEF_P4"
 read -r PORT_ANYTLS
 [ -z "$PORT_ANYTLS" ] && PORT_ANYTLS="$DEF_P4"
 
-echo -e "${CYAN}========================================================${NC}"
-echo -e "${YELLOW}[4/6] 正在生成密钥、自签证书与配置文件...${NC}"
+printf "%b\n" "${CYAN}========================================================${NC}"
+printf "%b\n" "${YELLOW}[4/6] 正在生成密钥、自签证书与配置文件...${NC}"
 
 UUID=$("$SB_BIN" generate uuid 2>/dev/null)
 [ -z "$UUID" ] && UUID=$(cat /proc/sys/kernel/random/uuid)
@@ -359,6 +393,8 @@ cat > "$CONFIG_FILE" << EOF
       "tag": "direct"
     }
   ],
+  "route": [
+  ],
   "route": {
     "rules": [
       {
@@ -371,7 +407,7 @@ cat > "$CONFIG_FILE" << EOF
 EOF
 
 # 5. 配置系统守护服务 (OpenRC / systemd + 28MiB 内存限制)
-echo -e "${YELLOW}[5/6] 正在配置后台守护服务 (GOMEMLIMIT=28MiB)...${NC}"
+printf "%b\n" "${YELLOW}[5/6] 正在配置后台守护服务 (GOMEMLIMIT=28MiB)...${NC}"
 if [ -f /etc/alpine-release ] && command -v rc-service >/dev/null 2>&1; then
     cat > /etc/init.d/sing-box << 'EOF'
 #!/sbin/openrc-run
@@ -421,10 +457,12 @@ EOF
 fi
 
 # 6. 生成 /usr/local/bin/sb 快捷管理面板
-echo -e "${YELLOW}[6/6] 正在安装 sb 快捷管理命令...${NC}"
+printf "%b\n" "${YELLOW}[6/6] 正在安装 sb 快捷管理命令...${NC}"
 rm -f "$SB_CMD"
 cat > "$SB_CMD" << 'EOF'
 #!/bin/sh
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
 CONFIG_FILE="/etc/sing-box/config.json"
 META_FILE="/etc/sing-box/meta.json"
 NODES_FILE="/root/nodes.txt"
@@ -463,7 +501,7 @@ kill_all_sb() {
 
 restart_sb() {
     if ! "$SB_BIN" check -c "$CONFIG_FILE" >/dev/null 2>&1; then
-        echo -e "${RED}[错误] 配置文件校验未通过：${NC}"
+        printf "%b\n" "${RED}[错误] 配置文件校验未通过：${NC}"
         "$SB_BIN" check -c "$CONFIG_FILE"
         return 1
     fi
@@ -483,9 +521,9 @@ restart_sb() {
     fi
 
     if is_running; then
-        echo -e "${GREEN}[成功] sing-box 服务已启动并正常运行！${NC}"
+        printf "%b\n" "${GREEN}[成功] sing-box 服务已启动并正常运行！${NC}"
     else
-        echo -e "${RED}[失败] sing-box 未能启动，报错信息如下：${NC}"
+        printf "%b\n" "${RED}[失败] sing-box 未能启动，报错信息如下：${NC}"
         "$SB_BIN" run -c "$CONFIG_FILE"
     fi
 }
@@ -538,7 +576,7 @@ get_server_ip() {
 
 refresh_nodes() {
     if [ ! -f "$CONFIG_FILE" ] || [ ! -f "$META_FILE" ]; then
-        echo -e "${RED}未找到配置文件！${NC}"
+        printf "%b\n" "${RED}未找到配置文件！${NC}"
         return 1
     fi
 
@@ -658,8 +696,8 @@ change_ip() {
     CUR_CIP=$(jq -r '.custom_ip // empty' "$META_FILE" 2>/dev/null)
     [ -z "$CUR_CIP" ] && CUR_CIP="自动检测 ($(get_server_ip))"
 
-    echo -e "\n${CYAN}--- 重新设置入站 IP ---${NC}"
-    echo -e "当前监听地址: ${GREEN}${CUR_LISTEN}${NC} | 当前节点入站地址: ${GREEN}${CUR_CIP}${NC}"
+    printf "\n%b\n" "${CYAN}--- 重新设置入站 IP ---${NC}"
+    printf "%b\n" "当前监听地址: ${GREEN}${CUR_LISTEN}${NC} | 当前节点入站地址: ${GREEN}${CUR_CIP}${NC}"
     echo "  1) 仅 IPv4  (监听 0.0.0.0，自动获取公网 IPv4)"
     echo "  2) 仅 IPv6  (监听 ::，自动获取公网 IPv6)"
     echo "  3) 双栈监听 (监听 ::，节点默认优先使用 IPv4)"
@@ -687,7 +725,7 @@ change_ip() {
             read -r CUSTOM_IP
             CUSTOM_IP=$(echo "$CUSTOM_IP" | tr -d '\r\n []')
             if [ -z "$CUSTOM_IP" ]; then
-                echo -e "${RED}输入不能为空！${NC}"
+                printf "%b\n" "${RED}输入不能为空！${NC}"
                 return 1
             fi
             if echo "$CUSTOM_IP" | grep -q ":"; then
@@ -709,7 +747,7 @@ change_ip() {
         '(.inbounds[].listen) = $listen' "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" \
         && mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
 
-    echo -e "${GREEN}入站 IP 设置已更新！${NC}"
+    printf "%b\n" "${GREEN}入站 IP 设置已更新！${NC}"
     restart_sb
     refresh_nodes
 }
@@ -717,9 +755,9 @@ change_ip() {
 delete_protocol() {
     TARGET_TAG=$1
     if [ -z "$TARGET_TAG" ]; then
-        echo -e "\n${CYAN}--- 当前已启用的协议列表 ---${NC}"
+        printf "\n%b\n" "${CYAN}--- 当前已启用的协议列表 ---${NC}"
         jq -r '.inbounds[] | "  * \(.tag) (协议: \(.type), 端口: \(.listen_port))"' "$CONFIG_FILE"
-        echo -e "${CYAN}----------------------------${NC}"
+        printf "%b\n" "${CYAN}----------------------------${NC}"
         echo "请选择要删除的协议:"
         echo "  1) 删除 VLESS-REALITY (vless-in)"
         echo "  2) 删除 Hysteria 2    (hy2-in)"
@@ -741,16 +779,16 @@ delete_protocol() {
             hy2|hysteria2|hy2-in) TARGET_TAG="hy2-in" ;;
             tuic|tuic-in) TARGET_TAG="tuic-in" ;;
             anytls|anytls-in) TARGET_TAG="anytls-in" ;;
-            *) echo -e "${RED}未知协议！${NC}"; return 1 ;;
+            *) printf "%b\n" "${RED}未知协议！${NC}"; return 1 ;;
         esac
     fi
 
     EXISTS=$(jq -r --arg tag "$TARGET_TAG" '.inbounds[] | select(.tag==$tag) | .tag' "$CONFIG_FILE")
-    [ -z "$EXISTS" ] && { echo -e "${YELLOW}协议不存在${NC}"; return; }
+    [ -z "$EXISTS" ] && { printf "%b\n" "${YELLOW}协议不存在${NC}"; return; }
 
     COUNT=$(jq '.inbounds | length' "$CONFIG_FILE")
     if [ "$COUNT" -le 1 ]; then
-        echo -e "${RED}[禁止] 至少需要保留 1 个入站协议！${NC}"
+        printf "%b\n" "${RED}[禁止] 至少需要保留 1 个入站协议！${NC}"
         return 1
     fi
 
@@ -760,13 +798,13 @@ delete_protocol() {
     jq --arg tag "$TARGET_TAG" 'del(.inbounds[] | select(.tag == $tag))' "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" \
         && mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
 
-    echo -e "${GREEN}已删除协议: ${TARGET_TAG}${NC}"
+    printf "%b\n" "${GREEN}已删除协议: ${TARGET_TAG}${NC}"
     restart_sb
     refresh_nodes
 }
 
 restore_protocol() {
-    echo -e "\n${CYAN}选择要恢复/添加的协议:${NC}"
+    printf "\n%b\n" "${CYAN}选择要恢复/添加的协议:${NC}"
     echo "  1) VLESS-REALITY"
     echo "  2) Hysteria 2"
     echo "  3) TUIC v5"
@@ -784,7 +822,7 @@ restore_protocol() {
     esac
 
     EXISTS=$(jq -r --arg tag "$TAG" '.inbounds[] | select(.tag==$tag) | .tag' "$CONFIG_FILE")
-    [ -n "$EXISTS" ] && { echo -e "${YELLOW}该协议已存在${NC}"; return; }
+    [ -n "$EXISTS" ] && { printf "%b\n" "${YELLOW}该协议已存在${NC}"; return; }
 
     UUID=$(jq -r '.uuid' "$META_FILE")
     PASS=$(jq -r '.password' "$META_FILE")
@@ -821,13 +859,13 @@ restore_protocol() {
     jq --argjson ib "$IB" '.inbounds += [$ib]' "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" \
         && mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
 
-    echo -e "${GREEN}已添加协议 ${TAG} (端口: ${NEW_PORT})${NC}"
+    printf "%b\n" "${GREEN}已添加协议 ${TAG} (端口: ${NEW_PORT})${NC}"
     restart_sb
     refresh_nodes
 }
 
 change_port() {
-    echo -e "\n${CYAN}--- 当前协议端口 ---${NC}"
+    printf "\n%b\n" "${CYAN}--- 当前协议端口 ---${NC}"
     jq -r '.inbounds[] | "  * \(.tag) (当前端口: \(.listen_port))"' "$CONFIG_FILE"
     echo "  1) VLESS-REALITY"
     echo "  2) Hysteria 2"
@@ -845,12 +883,12 @@ change_port() {
     esac
 
     EXISTS=$(jq -r --arg tag "$TAG" '.inbounds[] | select(.tag==$tag) | .tag' "$CONFIG_FILE")
-    [ -z "$EXISTS" ] && { echo -e "${RED}该协议不存在${NC}"; return; }
+    [ -z "$EXISTS" ] && { printf "%b\n" "${RED}该协议不存在${NC}"; return; }
 
     printf "输入新端口 (1-65535): "
     read -r NEW_PORT
     if ! echo "$NEW_PORT" | grep -Eq '^[0-9]+$' || [ "$NEW_PORT" -lt 1 ] || [ "$NEW_PORT" -gt 65535 ]; then
-        echo -e "${RED}端口无效${NC}"
+        printf "%b\n" "${RED}端口无效${NC}"
         return
     fi
 
@@ -866,8 +904,8 @@ change_port() {
 }
 
 show_status() {
-    echo -e "\n${CYAN}--- 运行状态 ---${NC}"
-    ps aux | grep "[s]ing-box" || echo -e "${RED}未运行${NC}"
+    printf "\n%b\n" "${CYAN}--- 运行状态 ---${NC}"
+    ps aux | grep "[s]ing-box" || printf "%b\n" "${RED}未运行${NC}"
     echo ""
     ss -tulnp | grep "sing-box" 2>/dev/null || true
 }
@@ -879,7 +917,7 @@ uninstall_sb() {
         [ "$confirm" != "y" ] && [ "$confirm" != "Y" ] && return
     fi
 
-    echo -e "${YELLOW}正在停止并清理所有服务与残留文件...${NC}"
+    printf "%b\n" "${YELLOW}正在停止并清理所有服务与残留文件...${NC}"
     kill_all_sb
 
     # 1. 移除系统服务与开机自启
@@ -894,12 +932,12 @@ uninstall_sb() {
     fi
 
     # 2. 清理脚本添加的 iptables 端口放行规则
-    if [ -f "$CONFIG_FILE" ]; then
+    if [ -f "$CONFIG_FILE" ] && command -v jq >/dev/null 2>&1; then
         for p in $(jq -r '.inbounds[].listen_port // empty' "$CONFIG_FILE" 2>/dev/null); do
             close_port "$p"
         done
     fi
-    if [ -f "$META_FILE" ]; then
+    if [ -f "$META_FILE" ] && command -v jq >/dev/null 2>&1; then
         for p in $(jq -r '.ports[] // empty' "$META_FILE" 2>/dev/null); do
             close_port "$p"
         done
@@ -912,9 +950,12 @@ uninstall_sb() {
 
     # 4. 彻底删除配置文件、证书、核心、日志与管理脚本
     rm -rf /etc/sing-box "$SB_BIN" "$NODES_FILE" /var/tmp/sing-box* /var/tmp/sing-box.log /run/sing-box.pid /var/run/sing-box.pid "$SB_CMD"
-    sync; echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
+    sync
+    if [ -w /proc/sys/vm/drop_caches ]; then
+        (echo 3 > /proc/sys/vm/drop_caches) 2>/dev/null || true
+    fi
 
-    echo -e "${GREEN}已彻底卸载并清空所有相关服务与配置，小鸡已恢复初始状态！${NC}"
+    printf "%b\n" "${GREEN}已彻底卸载并清空所有相关服务与配置，小鸡已恢复初始状态！${NC}"
     exit 0
 }
 
@@ -929,19 +970,19 @@ case "$1" in
 esac
 
 while true; do
-    echo -e "\n${CYAN}================================================${NC}"
-    echo -e "${CYAN}         sing-box 管理面板 (命令: sb)           ${NC}"
-    echo -e "${CYAN}================================================${NC}"
-    echo -e "  ${GREEN}1.${NC} 查看节点链接 / 订阅串 / Clash配置"
-    echo -e "  ${GREEN}2.${NC} 修改指定协议端口"
-    echo -e "  ${GREEN}3.${NC} 重新设置入站 IP"
-    echo -e "  ${YELLOW}4.${NC} 删除指定协议"
-    echo -e "  ${YELLOW}5.${NC} 恢复/添加协议"
-    echo -e "  ${GREEN}6.${NC} 查看运行状态"
-    echo -e "  ${GREEN}7.${NC} 重启服务"
-    echo -e "  ${RED}8.${NC} 彻底卸载并恢复初始状态"
-    echo -e "  ${GREEN}0.${NC} 退出"
-    echo -e "${CYAN}================================================${NC}"
+    printf "\n%b\n" "${CYAN}================================================${NC}"
+    printf "%b\n" "${CYAN}         sing-box 管理面板 (命令: sb)           ${NC}"
+    printf "%b\n" "${CYAN}================================================${NC}"
+    printf "%b\n" "  ${GREEN}1.${NC} 查看节点链接 / 订阅串 / Clash配置"
+    printf "%b\n" "  ${GREEN}2.${NC} 修改指定协议端口"
+    printf "%b\n" "  ${GREEN}3.${NC} 重新设置入站 IP"
+    printf "%b\n" "  ${YELLOW}4.${NC} 删除指定协议"
+    printf "%b\n" "  ${YELLOW}5.${NC} 恢复/添加协议"
+    printf "%b\n" "  ${GREEN}6.${NC} 查看运行状态"
+    printf "%b\n" "  ${GREEN}7.${NC} 重启服务"
+    printf "%b\n" "  ${RED}8.${NC} 彻底卸载并恢复初始状态"
+    printf "%b\n" "  ${GREEN}0.${NC} 退出"
+    printf "%b\n" "${CYAN}================================================${NC}"
     printf "选项 [0-8]: "
     read -r opt
     case "$opt" in
