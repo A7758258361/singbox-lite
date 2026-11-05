@@ -148,12 +148,26 @@ echo -e "${YELLOW}请选择服务器监听的 IP 入口 (监听地址):${NC}"
 echo "  1) 仅 IPv4  (0.0.0.0)      - 推荐纯 IPv4 机器或防止双栈冲突"
 echo "  2) 仅 IPv6  ([::])         - 适用于纯 IPv6 小鸡"
 echo "  3) 双栈监听 (::)           - 同时支持 IPv4 和 IPv6"
-printf "请输入选项 [1-3, 默认 1]: "
+echo "  4) 自定义入站 IP/域名      - 手动指定节点连接地址"
+printf "请输入选项 [1-4, 默认 1]: "
 read -r ip_choice
+CUSTOM_IP=""
 case "$ip_choice" in
     2) LISTEN_ADDR="::" ;;
     3) LISTEN_ADDR="::" ;;
-    *) LISTEN_ADDR="0.0.0.0" ;;
+    4)
+        printf "请输入自定义入站 IP 或域名: "
+        read -r CUSTOM_IP
+        CUSTOM_IP=$(echo "$CUSTOM_IP" | tr -d '\r\n []')
+        if echo "$CUSTOM_IP" | grep -q ":"; then
+            LISTEN_ADDR="::"
+            ip_choice="2"
+        else
+            LISTEN_ADDR="0.0.0.0"
+            ip_choice="1"
+        fi
+        ;;
+    *) ip_choice="1"; LISTEN_ADDR="0.0.0.0" ;;
 esac
 
 get_free_port() {
@@ -219,6 +233,7 @@ jq -n \
     --arg sid "$SHORT_ID" \
     --arg listen "$LISTEN_ADDR" \
     --arg ip_choice "$ip_choice" \
+    --arg custom_ip "$CUSTOM_IP" \
     --argjson pr "$PORT_REALITY" \
     --argjson ph "$PORT_HY2" \
     --argjson pt "$PORT_TUIC" \
@@ -233,6 +248,7 @@ jq -n \
         short_id: $sid,
         listen: $listen,
         ip_choice: $ip_choice,
+        custom_ip: $custom_ip,
         ports: {
             "vless-in": $pr,
             "hy2-in": $ph,
@@ -421,6 +437,16 @@ YELLOW='\033[0;33m'
 CYAN='\033[0;36m'
 NC='\033[0m'
 
+get_free_port() {
+    while true; do
+        R=$((20000 + ($(od -An -N2 -tu2 /dev/urandom | tr -d ' ') % 35000)))
+        if ! ss -tuln 2>/dev/null | grep -q ":$R "; then
+            echo "$R"
+            return
+        fi
+    done
+}
+
 is_running() {
     pidof sing-box >/dev/null 2>&1 || ps aux 2>/dev/null | grep "[s]ing-box run" >/dev/null 2>&1
 }
@@ -471,7 +497,28 @@ open_port() {
     iptables -C INPUT -p udp --dport "$PORT" -j ACCEPT 2>/dev/null || iptables -I INPUT -p udp --dport "$PORT" -j ACCEPT 2>/dev/null || true
 }
 
+close_port() {
+    PORT=$1
+    [ -z "$PORT" ] && return
+    while iptables -C INPUT -p tcp --dport "$PORT" -j ACCEPT 2>/dev/null; do
+        iptables -D INPUT -p tcp --dport "$PORT" -j ACCEPT 2>/dev/null || break
+    done
+    while iptables -C INPUT -p udp --dport "$PORT" -j ACCEPT 2>/dev/null; do
+        iptables -D INPUT -p udp --dport "$PORT" -j ACCEPT 2>/dev/null || break
+    done
+}
+
 get_server_ip() {
+    CUSTOM_IP=$(jq -r '.custom_ip // empty' "$META_FILE" 2>/dev/null)
+    if [ -n "$CUSTOM_IP" ]; then
+        if echo "$CUSTOM_IP" | grep -q ":"; then
+            echo "[${CUSTOM_IP}]"
+        else
+            echo "$CUSTOM_IP"
+        fi
+        return
+    fi
+
     if [ "$(jq -r '.ip_choice // empty' "$META_FILE" 2>/dev/null)" != "2" ]; then
         IP4=$(curl -s4m4 https://api.ipify.org 2>/dev/null || curl -s4m4 https://ip.sb 2>/dev/null)
         IP4=$(echo "$IP4" | tr -d '\r\n ')
@@ -606,6 +653,67 @@ EOC
     cat "$NODES_FILE"
 }
 
+change_ip() {
+    CUR_LISTEN=$(jq -r '.listen // "0.0.0.0"' "$META_FILE" 2>/dev/null)
+    CUR_CIP=$(jq -r '.custom_ip // empty' "$META_FILE" 2>/dev/null)
+    [ -z "$CUR_CIP" ] && CUR_CIP="自动检测 ($(get_server_ip))"
+
+    echo -e "\n${CYAN}--- 重新设置入站 IP ---${NC}"
+    echo -e "当前监听地址: ${GREEN}${CUR_LISTEN}${NC} | 当前节点入站地址: ${GREEN}${CUR_CIP}${NC}"
+    echo "  1) 仅 IPv4  (监听 0.0.0.0，自动获取公网 IPv4)"
+    echo "  2) 仅 IPv6  (监听 ::，自动获取公网 IPv6)"
+    echo "  3) 双栈监听 (监听 ::，节点默认优先使用 IPv4)"
+    echo "  4) 自定义入站 IP/域名 (手动输入指定连接地址)"
+    echo "  0) 返回"
+    printf "请选择 [0-4]: "
+    read -r ip_opt
+
+    CUSTOM_IP=""
+    case "$ip_opt" in
+        1)
+            NEW_LISTEN="0.0.0.0"
+            NEW_CHOICE="1"
+            ;;
+        2)
+            NEW_LISTEN="::"
+            NEW_CHOICE="2"
+            ;;
+        3)
+            NEW_LISTEN="::"
+            NEW_CHOICE="3"
+            ;;
+        4)
+            printf "请输入自定义入站 IP 或域名: "
+            read -r CUSTOM_IP
+            CUSTOM_IP=$(echo "$CUSTOM_IP" | tr -d '\r\n []')
+            if [ -z "$CUSTOM_IP" ]; then
+                echo -e "${RED}输入不能为空！${NC}"
+                return 1
+            fi
+            if echo "$CUSTOM_IP" | grep -q ":"; then
+                NEW_LISTEN="::"
+                NEW_CHOICE="2"
+            else
+                NEW_LISTEN="0.0.0.0"
+                NEW_CHOICE="1"
+            fi
+            ;;
+        *) return ;;
+    esac
+
+    jq --arg listen "$NEW_LISTEN" --arg choice "$NEW_CHOICE" --arg cip "$CUSTOM_IP" \
+        '.listen = $listen | .ip_choice = $choice | .custom_ip = $cip' "$META_FILE" > "${META_FILE}.tmp" \
+        && mv "${META_FILE}.tmp" "$META_FILE"
+
+    jq --arg listen "$NEW_LISTEN" \
+        '(.inbounds[].listen) = $listen' "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" \
+        && mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
+
+    echo -e "${GREEN}入站 IP 设置已更新！${NC}"
+    restart_sb
+    refresh_nodes
+}
+
 delete_protocol() {
     TARGET_TAG=$1
     if [ -z "$TARGET_TAG" ]; then
@@ -645,6 +753,9 @@ delete_protocol() {
         echo -e "${RED}[禁止] 至少需要保留 1 个入站协议！${NC}"
         return 1
     fi
+
+    OLD_PORT=$(jq -r --arg tag "$TARGET_TAG" '.inbounds[] | select(.tag==$tag) | .listen_port // empty' "$CONFIG_FILE")
+    close_port "$OLD_PORT"
 
     jq --arg tag "$TARGET_TAG" 'del(.inbounds[] | select(.tag == $tag))' "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" \
         && mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
@@ -743,77 +854,15 @@ change_port() {
         return
     fi
 
+    OLD_PORT=$(jq -r --arg tag "$TAG" '.inbounds[] | select(.tag==$tag) | .listen_port // empty' "$CONFIG_FILE")
+    close_port "$OLD_PORT"
+
     jq --arg tag "$TAG" --argjson port "$NEW_PORT" \
         '(.inbounds[] | select(.tag == $tag) | .listen_port) = $port' "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" \
         && mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
 
     restart_sb
     refresh_nodes
-}
-
-change_ip() {
-    CUR_LISTEN=$(jq -r '.listen // "0.0.0.0"' "$META_FILE" 2>/dev/null)
-    CUR_CHOICE=$(jq -r '.ip_choice // "1"' "$META_FILE" 2>/dev/null)
-    echo -e "\n${CYAN}--- 重新设置入站 IP (当前监听: ${CUR_LISTEN}, 选项: ${CUR_CHOICE}) ---${NC}"
-    echo "  1) 仅 IPv4  (0.0.0.0)      - 节点使用 IPv4 地址"
-    echo "  2) 仅 IPv6  ([::])         - 节点使用 IPv6 地址"
-    echo "  3) 双栈监听 (::)           - 同时支持 IPv4 和 IPv6"
-    echo "  0) 返回"
-    printf "请输入选项 [0-3]: "
-    read -r new_ip_choice
-    case "$new_ip_choice" in
-        1) NEW_LISTEN="0.0.0.0" ;;
-        2) NEW_LISTEN="::" ;;
-        3) NEW_LISTEN="::" ;;
-        *) return ;;
-    esac
-
-    jq --arg listen "$NEW_LISTEN" --arg ipc "$new_ip_choice" \
-        '.listen = $listen | .ip_choice = $ipc' "$META_FILE" > "${META_FILE}.tmp" \
-        && mv "${META_FILE}.tmp" "$META_FILE"
-
-    jq --arg listen "$NEW_LISTEN" \
-        '(.inbounds[].listen) = $listen' "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" \
-        && mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
-
-    echo -e "${GREEN}入站 IP 已切换为: ${NEW_LISTEN}${NC}"
-    restart_sb
-    refresh_nodes
-}
-
-uninstall_sb() {
-    printf "确认彻底卸载并清空所有服务及配置，恢复初始状态？[y/N]: "
-    read -r confirm
-    if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
-        kill_all_sb
-
-        if [ -f "$CONFIG_FILE" ]; then
-            for p in $(jq -r '.inbounds[].listen_port // empty' "$CONFIG_FILE" 2>/dev/null); do
-                iptables -D INPUT -p tcp --dport "$p" -j ACCEPT 2>/dev/null || true
-                iptables -D INPUT -p udp --dport "$p" -j ACCEPT 2>/dev/null || true
-            done
-        fi
-
-        if [ -f "$META_FILE" ]; then
-            for p in $(jq -r '.ports[] // empty' "$META_FILE" 2>/dev/null); do
-                iptables -D INPUT -p tcp --dport "$p" -j ACCEPT 2>/dev/null || true
-                iptables -D INPUT -p udp --dport "$p" -j ACCEPT 2>/dev/null || true
-            done
-        fi
-
-        rc-update del sing-box default >/dev/null 2>&1 || true
-        rm -f /etc/init.d/sing-box
-
-        systemctl disable sing-box >/dev/null 2>&1 || true
-        rm -f /etc/systemd/system/sing-box.service
-        systemctl daemon-reload >/dev/null 2>&1 || true
-
-        apk del sing-box >/dev/null 2>&1 || true
-
-        rm -rf /etc/sing-box "$SB_BIN" "$NODES_FILE" /var/tmp/sing-box* "$SB_CMD"
-        echo -e "${GREEN}已彻底卸载所有服务与残留文件，恢复初始状态！${NC}"
-        exit 0
-    fi
 }
 
 show_status() {
@@ -823,6 +872,52 @@ show_status() {
     ss -tulnp | grep "sing-box" 2>/dev/null || true
 }
 
+uninstall_sb() {
+    if [ "$1" != "-y" ]; then
+        printf "确认彻底卸载并清空所有服务、恢复小鸡初始状态？[y/N]: "
+        read -r confirm
+        [ "$confirm" != "y" ] && [ "$confirm" != "Y" ] && return
+    fi
+
+    echo -e "${YELLOW}正在停止并清理所有服务与残留文件...${NC}"
+    kill_all_sb
+
+    # 1. 移除系统服务与开机自启
+    if [ -f /etc/alpine-release ] && command -v rc-update >/dev/null 2>&1; then
+        rc-update del sing-box default >/dev/null 2>&1 || true
+        rm -f /etc/init.d/sing-box
+    fi
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl disable sing-box >/dev/null 2>&1 || true
+        rm -f /etc/systemd/system/sing-box.service
+        systemctl daemon-reload >/dev/null 2>&1 || true
+    fi
+
+    # 2. 清理脚本添加的 iptables 端口放行规则
+    if [ -f "$CONFIG_FILE" ]; then
+        for p in $(jq -r '.inbounds[].listen_port // empty' "$CONFIG_FILE" 2>/dev/null); do
+            close_port "$p"
+        done
+    fi
+    if [ -f "$META_FILE" ]; then
+        for p in $(jq -r '.ports[] // empty' "$META_FILE" 2>/dev/null); do
+            close_port "$p"
+        done
+    fi
+
+    # 3. 卸载可能由 Alpine apk 安装的 sing-box 包
+    if [ -f /etc/alpine-release ] && apk info -e sing-box >/dev/null 2>&1; then
+        apk del sing-box >/dev/null 2>&1 || true
+    fi
+
+    # 4. 彻底删除配置文件、证书、核心、日志与管理脚本
+    rm -rf /etc/sing-box "$SB_BIN" "$NODES_FILE" /var/tmp/sing-box* /var/tmp/sing-box.log /run/sing-box.pid /var/run/sing-box.pid "$SB_CMD"
+    sync; echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
+
+    echo -e "${GREEN}已彻底卸载并清空所有相关服务与配置，小鸡已恢复初始状态！${NC}"
+    exit 0
+}
+
 case "$1" in
     list|nodes) refresh_nodes; exit 0 ;;
     ip) change_ip; exit 0 ;;
@@ -830,7 +925,7 @@ case "$1" in
     add|restore) restore_protocol; exit 0 ;;
     restart) restart_sb; exit 0 ;;
     status) show_status; exit 0 ;;
-    uninstall) uninstall_sb; exit 0 ;;
+    uninstall) uninstall_sb "$2"; exit 0 ;;
 esac
 
 while true; do
