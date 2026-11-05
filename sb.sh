@@ -222,18 +222,22 @@ DEF_P4=$(get_free_port)
 printf "\n%b\n" "${YELLOW}--- 自定义端口配置 (直接回车则使用随机生成的默认端口) ---${NC}"
 printf "请输入 VLESS-REALITY 端口 [默认: %s]: " "$DEF_P1"
 read -r PORT_REALITY
+PORT_REALITY=$(echo "$PORT_REALITY" | tr -d ' \r\n')
 [ -z "$PORT_REALITY" ] && PORT_REALITY="$DEF_P1"
 
 printf "请输入 Hysteria 2 端口   [默认: %s]: " "$DEF_P2"
 read -r PORT_HY2
+PORT_HY2=$(echo "$PORT_HY2" | tr -d ' \r\n')
 [ -z "$PORT_HY2" ] && PORT_HY2="$DEF_P2"
 
 printf "请输入 TUIC v5 端口      [默认: %s]: " "$DEF_P3"
 read -r PORT_TUIC
+PORT_TUIC=$(echo "$PORT_TUIC" | tr -d ' \r\n')
 [ -z "$PORT_TUIC" ] && PORT_TUIC="$DEF_P3"
 
 printf "请输入 AnyTLS 端口       [默认: %s]: " "$DEF_P4"
 read -r PORT_ANYTLS
+PORT_ANYTLS=$(echo "$PORT_ANYTLS" | tr -d ' \r\n')
 [ -z "$PORT_ANYTLS" ] && PORT_ANYTLS="$DEF_P4"
 
 printf "%b\n" "${CYAN}========================================================${NC}"
@@ -256,6 +260,8 @@ openssl req -new -x509 -days 3650 -key /etc/sing-box/private.key -out /etc/sing-
     -subj "/CN=${TLS_SNI}" -addext "subjectAltName=DNS:${TLS_SNI}" 2>/dev/null || \
 openssl req -new -x509 -days 3650 -key /etc/sing-box/private.key -out /etc/sing-box/cert.pem \
     -subj "/CN=${TLS_SNI}" 2>/dev/null
+
+rm -f "$META_FILE" "$CONFIG_FILE"
 
 jq -n \
     --arg uuid "$UUID" \
@@ -291,118 +297,128 @@ jq -n \
         }
     }' > "$META_FILE"
 
-cat > "$CONFIG_FILE" << EOF
-{
-  "log": {
-    "level": "warn",
-    "timestamp": true
-  },
-  "inbounds": [
-    {
-      "type": "vless",
-      "tag": "vless-in",
-      "listen": "${LISTEN_ADDR}",
-      "listen_port": ${PORT_REALITY},
-      "users": [
+jq -n \
+    --arg listen "$LISTEN_ADDR" \
+    --arg uuid "$UUID" \
+    --arg pass "$PASS" \
+    --arg rsni "$REALITY_SNI" \
+    --arg tsni "$TLS_SNI" \
+    --arg priv "$PRIVATE_KEY" \
+    --arg sid "$SHORT_ID" \
+    --argjson pr "$PORT_REALITY" \
+    --argjson ph "$PORT_HY2" \
+    --argjson pt "$PORT_TUIC" \
+    --argjson pa "$PORT_ANYTLS" \
+    '{
+      log: {
+        level: "warn",
+        timestamp: true
+      },
+      inbounds: [
         {
-          "uuid": "${UUID}",
-          "flow": "xtls-rprx-vision"
+          type: "vless",
+          tag: "vless-in",
+          listen: $listen,
+          listen_port: $pr,
+          users: [
+            {
+              uuid: $uuid,
+              flow: "xtls-rprx-vision"
+            }
+          ],
+          tls: {
+            enabled: true,
+            server_name: $rsni,
+            reality: {
+              enabled: true,
+              handshake: {
+                server: $rsni,
+                server_port: 443
+              },
+              private_key: $priv,
+              short_id: [
+                $sid
+              ]
+            }
+          }
+        },
+        {
+          type: "hysteria2",
+          tag: "hy2-in",
+          listen: $listen,
+          listen_port: $ph,
+          users: [
+            {
+              password: $pass
+            }
+          ],
+          tls: {
+            enabled: true,
+            server_name: $tsni,
+            alpn: [
+              "h3"
+            ],
+            certificate_path: "/etc/sing-box/cert.pem",
+            key_path: "/etc/sing-box/private.key"
+          }
+        },
+        {
+          type: "tuic",
+          tag: "tuic-in",
+          listen: $listen,
+          listen_port: $pt,
+          users: [
+            {
+              uuid: $uuid,
+              password: $pass
+            }
+          ],
+          congestion_control: "bbr",
+          tls: {
+            enabled: true,
+            server_name: $tsni,
+            alpn: [
+              "h3"
+            ],
+            certificate_path: "/etc/sing-box/cert.pem",
+            key_path: "/etc/sing-box/private.key"
+          }
+        },
+        {
+          type: "anytls",
+          tag: "anytls-in",
+          listen: $listen,
+          listen_port: $pa,
+          users: [
+            {
+              name: "default",
+              password: $pass
+            }
+          ],
+          padding_scheme: [],
+          tls: {
+            enabled: true,
+            server_name: $tsni,
+            certificate_path: "/etc/sing-box/cert.pem",
+            key_path: "/etc/sing-box/private.key"
+          }
         }
       ],
-      "tls": {
-        "enabled": true,
-        "server_name": "${REALITY_SNI}",
-        "reality": {
-          "enabled": true,
-          "handshake": {
-            "server": "${REALITY_SNI}",
-            "server_port": 443
-          },
-          "private_key": "${PRIVATE_KEY}",
-          "short_id": [
-            "${SHORT_ID}"
-          ]
-        }
-      }
-    },
-    {
-      "type": "hysteria2",
-      "tag": "hy2-in",
-      "listen": "${LISTEN_ADDR}",
-      "listen_port": ${PORT_HY2},
-      "users": [
+      outbounds: [
         {
-          "password": "${PASS}"
+          type: "direct",
+          tag: "direct"
         }
       ],
-      "tls": {
-        "enabled": true,
-        "server_name": "${TLS_SNI}",
-        "alpn": [
-          "h3"
+      route: {
+        rules: [
+          {
+            action: "sniff"
+          }
         ],
-        "certificate_path": "/etc/sing-box/cert.pem",
-        "key_path": "/etc/sing-box/private.key"
+        final: "direct"
       }
-    },
-    {
-      "type": "tuic",
-      "tag": "tuic-in",
-      "listen": "${LISTEN_ADDR}",
-      "listen_port": ${PORT_TUIC},
-      "users": [
-        {
-          "uuid": "${UUID}",
-          "password": "${PASS}"
-        }
-      ],
-      "congestion_control": "bbr",
-      "tls": {
-        "enabled": true,
-        "server_name": "${TLS_SNI}",
-        "alpn": [
-          "h3"
-        ],
-        "certificate_path": "/etc/sing-box/cert.pem",
-        "key_path": "/etc/sing-box/private.key"
-      }
-    },
-    {
-      "type": "anytls",
-      "tag": "anytls-in",
-      "listen": "${LISTEN_ADDR}",
-      "listen_port": ${PORT_ANYTLS},
-      "users": [
-        {
-          "name": "default",
-          "password": "${PASS}"
-        }
-      ],
-      "padding_scheme": [],
-      "tls": {
-        "enabled": true,
-        "server_name": "${TLS_SNI}",
-        "certificate_path": "/etc/sing-box/cert.pem",
-        "key_path": "/etc/sing-box/private.key"
-      }
-    }
-  ],
-  "outbounds": [
-    {
-      "type": "direct",
-      "tag": "direct"
-    }
-  ],
-  "route": {
-    "rules": [
-      {
-        "action": "sniff"
-      }
-    ],
-    "final": "direct"
-  }
-}
-EOF
+    }' > "$CONFIG_FILE"
 
 # 5. 配置系统守护服务 (OpenRC / systemd + 28MiB 内存限制)
 printf "%b\n" "${YELLOW}[5/6] 正在配置后台守护服务 (GOMEMLIMIT=28MiB)...${NC}"
@@ -498,6 +514,13 @@ kill_all_sb() {
 }
 
 restart_sb() {
+    if [ -f "$CONFIG_FILE" ] && command -v jq >/dev/null 2>&1; then
+        if jq -e '(.route | type) != "object"' "$CONFIG_FILE" >/dev/null 2>&1; then
+            jq '.route = {"rules":[{"action":"sniff"}],"final":"direct"}' "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" \
+                && mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
+        fi
+    fi
+
     if ! "$SB_BIN" check -c "$CONFIG_FILE" >/dev/null 2>&1; then
         printf "%b\n" "${RED}[错误] 配置文件校验未通过：${NC}"
         "$SB_BIN" check -c "$CONFIG_FILE"
@@ -833,6 +856,7 @@ restore_protocol() {
     DEF_P=$(get_free_port)
     printf "输入监听端口 [回车默认随机 %s]: " "$DEF_P"
     read -r NEW_PORT
+    NEW_PORT=$(echo "$NEW_PORT" | tr -d ' \r\n')
     [ -z "$NEW_PORT" ] && NEW_PORT="$DEF_P"
 
     case "$TAG" in
@@ -885,6 +909,7 @@ change_port() {
 
     printf "输入新端口 (1-65535): "
     read -r NEW_PORT
+    NEW_PORT=$(echo "$NEW_PORT" | tr -d ' \r\n')
     if ! echo "$NEW_PORT" | grep -Eq '^[0-9]+$' || [ "$NEW_PORT" -lt 1 ] || [ "$NEW_PORT" -gt 65535 ]; then
         printf "%b\n" "${RED}端口无效${NC}"
         return
