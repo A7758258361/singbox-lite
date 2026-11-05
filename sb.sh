@@ -393,8 +393,6 @@ cat > "$CONFIG_FILE" << EOF
       "tag": "direct"
     }
   ],
-  "route": [
-  ],
   "route": {
     "rules": [
       {
