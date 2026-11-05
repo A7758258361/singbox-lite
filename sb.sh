@@ -413,6 +413,7 @@ CONFIG_FILE="/etc/sing-box/config.json"
 META_FILE="/etc/sing-box/meta.json"
 NODES_FILE="/root/nodes.txt"
 SB_BIN="/usr/local/bin/sing-box"
+SB_CMD="/usr/local/bin/sb"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -750,6 +751,71 @@ change_port() {
     refresh_nodes
 }
 
+change_ip() {
+    CUR_LISTEN=$(jq -r '.listen // "0.0.0.0"' "$META_FILE" 2>/dev/null)
+    CUR_CHOICE=$(jq -r '.ip_choice // "1"' "$META_FILE" 2>/dev/null)
+    echo -e "\n${CYAN}--- 重新设置入站 IP (当前监听: ${CUR_LISTEN}, 选项: ${CUR_CHOICE}) ---${NC}"
+    echo "  1) 仅 IPv4  (0.0.0.0)      - 节点使用 IPv4 地址"
+    echo "  2) 仅 IPv6  ([::])         - 节点使用 IPv6 地址"
+    echo "  3) 双栈监听 (::)           - 同时支持 IPv4 和 IPv6"
+    echo "  0) 返回"
+    printf "请输入选项 [0-3]: "
+    read -r new_ip_choice
+    case "$new_ip_choice" in
+        1) NEW_LISTEN="0.0.0.0" ;;
+        2) NEW_LISTEN="::" ;;
+        3) NEW_LISTEN="::" ;;
+        *) return ;;
+    esac
+
+    jq --arg listen "$NEW_LISTEN" --arg ipc "$new_ip_choice" \
+        '.listen = $listen | .ip_choice = $ipc' "$META_FILE" > "${META_FILE}.tmp" \
+        && mv "${META_FILE}.tmp" "$META_FILE"
+
+    jq --arg listen "$NEW_LISTEN" \
+        '(.inbounds[].listen) = $listen' "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" \
+        && mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
+
+    echo -e "${GREEN}入站 IP 已切换为: ${NEW_LISTEN}${NC}"
+    restart_sb
+    refresh_nodes
+}
+
+uninstall_sb() {
+    printf "确认彻底卸载并清空所有服务及配置，恢复初始状态？[y/N]: "
+    read -r confirm
+    if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
+        kill_all_sb
+
+        if [ -f "$CONFIG_FILE" ]; then
+            for p in $(jq -r '.inbounds[].listen_port // empty' "$CONFIG_FILE" 2>/dev/null); do
+                iptables -D INPUT -p tcp --dport "$p" -j ACCEPT 2>/dev/null || true
+                iptables -D INPUT -p udp --dport "$p" -j ACCEPT 2>/dev/null || true
+            done
+        fi
+
+        if [ -f "$META_FILE" ]; then
+            for p in $(jq -r '.ports[] // empty' "$META_FILE" 2>/dev/null); do
+                iptables -D INPUT -p tcp --dport "$p" -j ACCEPT 2>/dev/null || true
+                iptables -D INPUT -p udp --dport "$p" -j ACCEPT 2>/dev/null || true
+            done
+        fi
+
+        rc-update del sing-box default >/dev/null 2>&1 || true
+        rm -f /etc/init.d/sing-box
+
+        systemctl disable sing-box >/dev/null 2>&1 || true
+        rm -f /etc/systemd/system/sing-box.service
+        systemctl daemon-reload >/dev/null 2>&1 || true
+
+        apk del sing-box >/dev/null 2>&1 || true
+
+        rm -rf /etc/sing-box "$SB_BIN" "$NODES_FILE" /var/tmp/sing-box* "$SB_CMD"
+        echo -e "${GREEN}已彻底卸载所有服务与残留文件，恢复初始状态！${NC}"
+        exit 0
+    fi
+}
+
 show_status() {
     echo -e "\n${CYAN}--- 运行状态 ---${NC}"
     ps aux | grep "[s]ing-box" || echo -e "${RED}未运行${NC}"
@@ -759,10 +825,12 @@ show_status() {
 
 case "$1" in
     list|nodes) refresh_nodes; exit 0 ;;
+    ip) change_ip; exit 0 ;;
     del|delete) delete_protocol "$2"; exit 0 ;;
     add|restore) restore_protocol; exit 0 ;;
     restart) restart_sb; exit 0 ;;
     status) show_status; exit 0 ;;
+    uninstall) uninstall_sb; exit 0 ;;
 esac
 
 while true; do
@@ -771,32 +839,25 @@ while true; do
     echo -e "${CYAN}================================================${NC}"
     echo -e "  ${GREEN}1.${NC} 查看节点链接 / 订阅串 / Clash配置"
     echo -e "  ${GREEN}2.${NC} 修改指定协议端口"
-    echo -e "  ${YELLOW}3.${NC} 删除指定协议"
-    echo -e "  ${YELLOW}4.${NC} 恢复/添加协议"
-    echo -e "  ${GREEN}5.${NC} 查看运行状态"
-    echo -e "  ${GREEN}6.${NC} 重启服务"
-    echo -e "  ${RED}7.${NC} 卸载"
+    echo -e "  ${GREEN}3.${NC} 重新设置入站 IP"
+    echo -e "  ${YELLOW}4.${NC} 删除指定协议"
+    echo -e "  ${YELLOW}5.${NC} 恢复/添加协议"
+    echo -e "  ${GREEN}6.${NC} 查看运行状态"
+    echo -e "  ${GREEN}7.${NC} 重启服务"
+    echo -e "  ${RED}8.${NC} 彻底卸载并恢复初始状态"
     echo -e "  ${GREEN}0.${NC} 退出"
     echo -e "${CYAN}================================================${NC}"
-    printf "选项 [0-7]: "
+    printf "选项 [0-8]: "
     read -r opt
     case "$opt" in
         1) refresh_nodes ;;
         2) change_port ;;
-        3) delete_protocol ;;
-        4) restore_protocol ;;
-        5) show_status ;;
-        6) restart_sb ;;
-        7)
-            printf "确认卸载？[y/N]: "
-            read -r confirm
-            if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
-                kill_all_sb
-                rm -rf /etc/sing-box "$SB_BIN" "$SB_CMD" "$NODES_FILE"
-                echo -e "${GREEN}已卸载${NC}"
-                exit 0
-            fi
-            ;;
+        3) change_ip ;;
+        4) delete_protocol ;;
+        5) restore_protocol ;;
+        6) show_status ;;
+        7) restart_sb ;;
+        8) uninstall_sb ;;
         0) exit 0 ;;
     esac
 done
